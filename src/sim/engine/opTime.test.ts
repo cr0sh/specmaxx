@@ -48,6 +48,24 @@ function gemm(m: number, n: number, k: number): GemmOp {
 }
 
 describe('T6 roofline (SYNTH_GPU)', () => {
+  it('a peer lookup without its intra-node DP path fails rather than being priced as a local gather', () => {
+    expect(() =>
+      opTime(
+        {
+          kind: 'embedding',
+          name: 'peer.lookup',
+          tokens: 4,
+          hidden: 8,
+          vocabShard: 500,
+          weight: { dtype: 'bf16' },
+          outputDtype: 'bf16',
+          peerReadBytes: 32,
+        },
+        CTX,
+      ),
+    ).toThrow(/needs a flat intra-node DP path/);
+  });
+
   it('roofline picks the larger term; a tie is compute-bound', () => {
     expect(roofline(1e-3, 2e-3)).toEqual({ sec: 2e-3, bound: 'memory' });
     expect(roofline(1e-3, 1e-3)).toEqual({ sec: 1e-3, bound: 'compute' });

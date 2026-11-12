@@ -418,6 +418,25 @@ describe('URL codec', () => {
     expect(encodeState(state({ quant: { weights: 'fp8_e4m3', bpw: 3 } }))).toBe('w=fp8_e4m3');
   });
 
+  it('round-trips device-only table sharing and drops it for every off-device table placement', () => {
+    const { state: s, dropped } = decodeState('ltdp=1');
+    expect(dropped).toEqual([]);
+    expect(s.deployment.offload).toEqual({ tables: { acrossDp: true } });
+    expect(encodeState(s)).toBe('ltdp=1');
+    expect(encodeState(DEFAULT_STATE)).not.toContain('ltdp');
+    expect(decodeState('ltdp=0').dropped).toEqual(['ltdp=0']);
+    for (const olt of ['ram', 'ssd', 'split']) {
+      const d = decodeState(`olt=${olt}&ltdp=1`);
+      expect(d.dropped).toContain('ltdp=1');
+      expect(d.state.deployment.offload?.tables?.acrossDp).toBeUndefined();
+      expect(encodeState(d.state)).not.toContain('ltdp');
+    }
+    expect(decodeState('ox=ram&ltdp=1').state.deployment.offload).toEqual({
+      experts: { tier: 'host_ram' },
+      tables: { acrossDp: true },
+    });
+  });
+
   it('keeps / : , . readable', () => {
     const q = encodeState(
       state({

@@ -278,7 +278,7 @@ export function memorySuggestions(input: MemorySuggestionInput): MemorySuggestio
           : []),
       ];
     }
-    return offload[group === 'tables' ? 'tables' : 'embeddings'] === undefined
+    return offload[group === 'tables' ? 'tables' : 'embeddings']?.tier === undefined
       ? [{ ...fresh, placement: { tier } }]
       : [];
   };

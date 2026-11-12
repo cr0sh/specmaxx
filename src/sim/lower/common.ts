@@ -72,6 +72,7 @@ export const ELEMENTWISE_FLOPS_PER_ELEM: Record<
   kv_pool: 4,
   kv_cache_write: 1,
   candidate_score: 2,
+  copy: 0,
 };
 
 /** Tokens processed per device step: `T = seqs·qLen`. Unit: tokens. */

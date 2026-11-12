@@ -138,9 +138,32 @@ describe('validateLink: the new fabric fields', () => {
           'latencySec',
           'allPortsCapPerDirectionBytesPerSec',
           'forwardingLatencySec',
+          'fullyConnectedDevices',
         ],
       },
     ],
+  });
+
+  it('full peer-domain size must be a sourced safe integer of at least two devices', () => {
+    expect(validateLink(sourced({ fullyConnectedDevices: 72 }))).toEqual([]);
+    expect(
+      validateLink({ ...SYNTH_IB, fullyConnectedDevices: 8 }).some((e) =>
+        /fullyConnectedDevices.*not covered/.test(e),
+      ),
+    ).toBe(true);
+    for (const size of [
+      0,
+      1,
+      2.5,
+      NaN,
+      Infinity,
+      Number.MAX_SAFE_INTEGER + 1,
+      '8' as unknown as number,
+    ]) {
+      expect(validateLink(sourced({ fullyConnectedDevices: size }))).toContain(
+        'link Synthetic InfiniBand: fullyConnectedDevices must be a safe integer ≥ 2',
+      );
+    }
   });
 
   it('accepts a cap ≥ the per-port bandwidth and a relay latency', () => {

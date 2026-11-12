@@ -63,6 +63,96 @@ describe('T17 input errors', () => {
     expect(validateInput(input({ tp: 8 }))).toEqual([]);
   });
 
+  it('shared Engram validates peer capability and modified P2P topology, not just the preset link', () => {
+    const model: ModelSpec = {
+      ...TINY_HC_NGRAM,
+      layers: TINY_HC_NGRAM.layers.map((layer) => ({
+        ...layer,
+        blocks: layer.blocks.map((b) =>
+          b.kind === 'ngram_embedding'
+            ? { ...b, headRows: Array.from({ length: b.rowsPerToken }, () => 1) }
+            : b,
+        ),
+      })),
+    };
+    const i = input(
+      { dp: 32 },
+      {
+        model,
+        workload: { batch: 32, promptLen: 128, decodeContextLen: 256 },
+        hardware: {
+          device: SYNTH_GPU,
+          topology: {
+            ...SYNTH_CLUSTER,
+            devicesPerNode: 72,
+            nodes: 1,
+            intraNode: { ...SYNTH_NVLINK, fullyConnectedDevices: 72 },
+          },
+        },
+        deployment: { offload: { lookupTables: { acrossDp: true } } },
+      },
+    );
+    expect(validateInput(i)).toEqual([]);
+    expectError(
+      {
+        ...i,
+        hardware: {
+          ...i.hardware,
+          topology: {
+            ...i.hardware.topology,
+            intraNode: { ...SYNTH_NVLINK, fullyConnectedDevices: undefined },
+          },
+        },
+      },
+      /without hash heads/,
+    );
+    const modified: SimInput = {
+      ...i,
+      hardware: {
+        ...i.hardware,
+        linkModifiers: {
+          intraNode: [
+            {
+              kind: 'p2p',
+              p2p: 'host_bounce',
+              hostBounce: { hostMemBandwidthBytesPerSec: 100e9, extraLatencySec: 1e-6 },
+              note: 'Synthetic host-bounce path',
+              sources: [],
+              estimatedReason: 'Test fixture',
+            },
+          ],
+        },
+      },
+    };
+    expectError(modified, /without hash heads/);
+  });
+
+  it.each(['ring', 'chain'] as const)(
+    'rejects strided lookup DP groups on a %s through input validation',
+    (kind) => {
+      expectError(
+        input(
+          { tp: 2, dp: 2 },
+          {
+            model: TINY_HC_NGRAM,
+            workload: { batch: 2, promptLen: 128, decodeContextLen: 256 },
+            hardware: {
+              device: SYNTH_GPU,
+              topology: {
+                ...SYNTH_CLUSTER,
+                devicesPerNode: 1,
+                nodes: 4,
+                interNodeFabric: { kind },
+              },
+            },
+            deployment: { offload: { lookupTables: { acrossDp: true } } },
+          },
+        ),
+        /DP group of 2 nodes 2 apart.*not modeled/,
+      );
+    },
+  );
+
   it('heads % tp', () => {
     // 32 heads over tp 3 (placement also rejects tp 3 on nodes of 8)
     expectError(input({ tp: 3 }), /heads \(32\) must be divisible by tp \(3\)/);
@@ -510,6 +600,73 @@ describe('deployment knobs (design doc §2, §3.6; U-3, U-13)', () => {
         offload({ lookupTables: { tier: 'host_ram', scaleLayout: 'pinned_host' } }, TINY_HC_NGRAM),
       ),
     ).toEqual(["deployment.offload.lookupTables.scaleLayout 'pinned_host' needs tier 'nvme'"]);
+  });
+
+  it.each(['true', 1, null])('rejects non-boolean table sharing: %j', (acrossDp) => {
+    expect(
+      errorsOf(
+        offload({ lookupTables: { acrossDp: acrossDp as unknown as boolean } }, TINY_HC_NGRAM),
+      ),
+    ).toContain('deployment.offload.lookupTables.acrossDp must be a boolean');
+  });
+
+  it.each(['acrossDP', 'placement', 'scaleLayout', 'layers'])(
+    'rejects unknown table config key %s rather than treating it as device placement',
+    (key) => {
+      const lookupTables = { [key]: 'typo' } as OffloadConfig['lookupTables'];
+      expect(errorsOf(offload({ lookupTables }, TINY_HC_NGRAM))).toContain(
+        `deployment.offload.lookupTables.${key}: unknown key (expected acrossDp or placements)`,
+      );
+    },
+  );
+
+  it('sharing requires device-only table placements, not device-only experts or embeddings', () => {
+    const lookupTables = { acrossDp: true };
+    expect(errorsOf(offload({ lookupTables }, TINY_HC_NGRAM))).toEqual([]);
+    expect(
+      errorsOf(input({}, { model: TINY_HC_NGRAM, deployment: { offload: { lookupTables } } })),
+    ).toEqual([]);
+    expect(
+      errorsOf(
+        offload(
+          { lookupTables: { ...lookupTables, placements: { tier: 'device' } } },
+          TINY_HC_NGRAM,
+        ),
+      ),
+    ).toEqual([]);
+    expect(
+      errorsOf(offload({ lookupTables, embeddings: { tier: 'host_ram' } }, TINY_HC_NGRAM)),
+    ).toEqual([]);
+    for (const tier of ['host_ram', 'nvme'] as const) {
+      expect(
+        errorsOf(
+          offload({ lookupTables: { ...lookupTables, placements: { tier } } }, TINY_HC_NGRAM),
+        ),
+      ).toContain(
+        'deployment.offload.lookupTables.acrossDp requires every lookup-table placement to be device',
+      );
+      expect(
+        errorsOf(
+          offload(
+            {
+              lookupTables: {
+                ...lookupTables,
+                placements: [
+                  { tier: 'device', layers: { from: 0, to: 1 } },
+                  { tier, layers: { from: 1, to: 2 } },
+                ],
+              },
+            },
+            TINY_HC_NGRAM,
+          ),
+        ),
+      ).toContain(
+        'deployment.offload.lookupTables.acrossDp requires every lookup-table placement to be device',
+      );
+    }
+    expect(errorsOf(offload({ lookupTables }, REF_DENSE_8B))).toEqual([
+      'deployment.offload.lookupTables.acrossDp: the model has no n-gram lookup table',
+    ]);
   });
 
   it('an off-device group on a dedicated device without a host link (no host.link, no hostInterface) is rejected', () => {

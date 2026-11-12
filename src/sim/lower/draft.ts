@@ -78,6 +78,8 @@ function draftContext(ctx: LoweringContext, qLen: number, kvLen: number): Loweri
   const draftCtx: LoweringContext = { ...ctx, qLen, kvLen };
   delete draftCtx.speculative;
   delete draftCtx.offload;
+  // The policy belongs to the target's n-gram tables, not the drafter's own weights.
+  delete draftCtx.lookupTables;
   if (experts !== undefined || embeddings !== undefined) {
     draftCtx.offload = { prefetchAccuracy: ctx.offload?.prefetchAccuracy ?? 0 };
     if (experts !== undefined) {

@@ -889,7 +889,8 @@ export function editableFields(device: DeviceSpec): EditableField[] {
 
 /**
  * The editable numbers of a link: bandwidth (GB/s per direction), latency (µs), host staging, and for multi-port
- * links the cap over all ports (GB/s per direction) and the relay latency per hop (µs).
+ * links the cap over all ports (GB/s per direction) and the relay latency per hop (µs); full peer-domain size
+ * (devices) where the link profile establishes one.
  */
 export function editableLinkFields(link: LinkSpec): EditableField[] {
   const labels: Record<string, [string, DisplayUnit]> = {
@@ -902,6 +903,7 @@ export function editableLinkFields(link: LinkSpec): EditableField[] {
     'hostBounce.extraLatencySec': ['Extra latency of the host copy', UNITS.us],
     allPortsCapPerDirectionBytesPerSec: ['Bandwidth cap, all ports', UNITS.gbps],
     forwardingLatencySec: ['Relay latency per hop', UNITS.us],
+    fullyConnectedDevices: ['Fully connected domain (devices)', UNITS.count],
   };
   return numericLeafPaths(link).map(({ path, value }) => {
     const [label, unit] = labels[path] ?? [path, UNITS.count];

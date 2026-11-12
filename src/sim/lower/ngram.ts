@@ -1,7 +1,8 @@
 /**
  * Lowering of hashed n-gram embeddings (`ngram_embedding`: Qwen4Exp PLE, DeepSeek-V4.1 Engram). The lookup table
- * is row-parallel over TP like the token embedding (`ceil(rows/tp)` rows per rank, a TP all-reduce combines the
- * gathered rows); the projections, the gate and the conv are REPLICATED on every TP rank.
+ * is normally row-parallel over TP like the token embedding (`ceil(rows/tp)` rows per rank, a TP all-reduce combines
+ * gathered rows). Optional DP sharing uses the row/head ownership and exchanges below instead. The projections,
+ * the gate and the conv are REPLICATED on every TP rank.
  * See docs/simulation-model.md §5 "n-gram embeddings".
  *
  * Notation: g = rowsPerToken, d = rowDim, O = outputDim, T = seqs·qLen.
@@ -13,7 +14,7 @@
 import { bytesPerElement, DTYPE_INFO, type TensorFormat } from '../ir/dtype';
 import { opBytes } from '../ir/metrics';
 import type { NgramEmbeddingBlock } from '../ir/model';
-import type { EmbeddingOp, Op, TransferOp } from '../ir/ops';
+import type { CollectiveOp, EmbeddingOp, Op, TransferOp } from '../ir/ops';
 import {
   actBpe,
   causalConvOp,
@@ -21,6 +22,8 @@ import {
   elementwise,
   hpBpe,
   linearGemm,
+  reduceBpe,
+  reduceDtype,
   stepTokens,
   tpAllReduce,
 } from './common';
@@ -111,10 +114,151 @@ export function tableFetchOp(
 }
 
 /**
+ * Largest resident table shard (rows), shared by residency and lookup lowering. D = sharing ? dp : 1,
+ * N = tp·D, g = rowsPerToken. Row layouts use ceil(tableRows/N); Engram peer reads use ceil(sum(headRows)/N).
+ * Head layouts use the largest sum of h = ceil(g/N) consecutive buckets; every rank must own a head.
+ * See docs/simulation-model.md §5 "Lookup tables across DP".
+ */
+function tableShardRows(block: NgramEmbeddingBlock, ctx: LoweringContext): number {
+  const dp = ctx.lookupTables === undefined ? 1 : ctx.parallel.dp;
+  // Formula: N = tp·D; R_row = ceil(tableRows/N); R_peer = ceil(Σ headRows/N).
+  const shards = ctx.parallel.tp * dp;
+  if (dp === 1 || block.headRows === undefined) return Math.ceil(block.tableRows / shards);
+  if (ctx.lookupTables?.peerReads) {
+    return Math.ceil(block.headRows.reduce((a, b) => a + b, 0) / shards);
+  }
+  // Formula: h = ceil(g/N); R_head = max_rank Σ_{j=rank·h}^{min((rank+1)·h,g)-1} headRows[j].
+  const perShard = Math.ceil(block.rowsPerToken / shards);
+  if ((shards - 1) * perShard >= block.rowsPerToken)
+    throw new Error('lookup-table sharding leaves ranks without hash heads');
+  let rows = 0;
+  for (let start = 0; start < block.headRows.length; start += perShard) {
+    rows = Math.max(
+      rows,
+      block.headRows.slice(start, start + perShard).reduce((a, b) => a + b, 0),
+    );
+  }
+  return rows;
+}
+
+/**
+ * Shared device-table retrieval (docs §5, "Lookup tables across DP"). Balanced replica token counts:
+ * Engram owns complete hash heads; row-layout tables own a fraction of rows. The result is always local T·g·d.
+ * Resolved peer reads on a fully connected NVLink domain stay inside the gather, not an invented collective.
+ */
+function sharedTableLookup(
+  block: NgramEmbeddingBlock,
+  ctx: LoweringContext,
+  gather: EmbeddingOp,
+): Op[] {
+  const { tp, dp } = ctx.parallel;
+  const T = stepTokens(ctx),
+    g = block.rowsPerToken,
+    d = block.rowDim,
+    act = actBpe(ctx);
+  if (block.headRows !== undefined && ctx.lookupTables?.peerReads) {
+    // Uniform ownership: each device serves T·g rows in total, including requests from peers.
+    // Formula: remote payload = T·g·rowBytes·(dp−1)/dp, per device and per direction.
+    // See docs/simulation-model.md §5 "Lookup tables across DP".
+    return [
+      {
+        ...gather,
+        peerReadBytes: (T * g * tableRowBytes(gather.weight, d).rowBytes * (dp - 1)) / dp,
+      },
+    ];
+  }
+  const idDtype = block.headRows === undefined ? 'int64' : 'int32';
+  const idBytes = block.headRows === undefined ? 8 : 4;
+  // Formula: I = T·D·g·idBytes (full all-gather output); workspace_ids = I + T·g·idBytes.
+  // See docs/simulation-model.md §5 "Lookup tables across DP".
+  const ids = T * dp * g * idBytes;
+  const ops: Op[] = [
+    {
+      kind: 'collective',
+      name: `${block.name}.dp_ids`,
+      collective: 'all_gather',
+      group: 'dp',
+      groupSize: dp,
+      messageBytes: ids,
+      dtype: idDtype,
+      workspaceBytes: ids + T * g * idBytes,
+    },
+  ];
+  if (block.headRows === undefined) {
+    const elems = T * dp * g * d;
+    // Every DP token has a masked output, but only the owned 1/(tp·dp) of its rows are read.
+    // Formula: R = T·g/tp; S_reduce = T·dp·g·d·max(bpe(act), 2); workspace = ids + 2·S_reduce.
+    // The masked buffer uses the reduction format (at least 16-bit), including with FP8 activations.
+    // See docs/simulation-model.md §5 "Reductions dtype", "Lookup tables across DP".
+    const reducedBytes = elems * reduceBpe(ctx);
+    ops.push(
+      { ...gather, tokens: T * dp * g, rowsRead: (T * g) / tp, outputDtype: reduceDtype(ctx) },
+      {
+        kind: 'collective',
+        name: `${block.name}.tp_dp_all_reduce`,
+        collective: 'all_reduce',
+        group: 'tp_dp',
+        groupSize: tp * dp,
+        messageBytes: reducedBytes,
+        dtype: reduceDtype(ctx),
+        workspaceBytes: ids + 2 * reducedBytes,
+      },
+    );
+    // Selecting the local replica's contiguous token window is a view.
+    return ops;
+  }
+  // Formula: h = ceil(g/(tp·D)); R_gather = T·D·h; S_stage = R_gather·d·a; E_local = T·D·h·d.
+  // DP all-gather full output = D·S_stage; select-copy traffic = 2·E_local·a.
+  // See docs/simulation-model.md §5 "Lookup tables across DP".
+  const heads = Math.ceil(g / (tp * dp));
+  const stagedBytes = T * dp * heads * d * act;
+  const localElems = T * dp * heads * d;
+  ops.push({ ...gather, tokens: T * dp * heads });
+  const rows: CollectiveOp = {
+    kind: 'collective',
+    name: `${block.name}.dp_rows`,
+    collective: 'all_gather',
+    group: 'dp',
+    groupSize: dp,
+    messageBytes: dp * stagedBytes,
+    dtype: ctx.quant.activations,
+    // Formula: workspace_rows = I + S_stage + D·S_stage + E_local·a.
+    // Rank-major output, persistent staged input, hash ids and the local-token selection coexist at the peak.
+    workspaceBytes: ids + stagedBytes + dp * stagedBytes + localElems * act,
+  };
+  ops.push(
+    rows,
+    elementwise(
+      `${block.name}.select_rows`,
+      'copy',
+      {
+        elems: localElems,
+        activationReadBytes: localElems * act,
+        activationWriteBytes: localElems * act,
+      },
+      ctx,
+    ),
+  );
+  // Formula: S_tp = tp·E_local·a (full output); workspace_tp = I + S_stage + (tp+1)·E_local·a.
+  if (tp > 1)
+    ops.push({
+      kind: 'collective',
+      name: `${block.name}.tp_heads`,
+      collective: 'all_gather',
+      group: 'tp',
+      groupSize: tp,
+      messageBytes: tp * localElems * act,
+      dtype: ctx.quant.activations,
+      workspaceBytes: ids + stagedBytes + (tp + 1) * localElems * act,
+    });
+  return ops;
+}
+
+/**
  * n-gram ops, in order: [row fetch, when the table is off-device] → the row gather (embedding op over T·g rows of d)
  * → [TP all-reduce of T·g·d] → each projection (m = T, module `ngram`) → `ngram_gate` over T·O (reads the
  * projection outputs and the stream, writes the stream; carries the `vectorParams` weights) → [dilated causal conv
- * over T·O].
+ * over T·O]. With DP sharing, {@link sharedTableLookup} replaces the gather + TP all-reduce only.
  */
 export function lowerNgram(
   block: NgramEmbeddingBlock,
@@ -126,14 +270,14 @@ export function lowerNgram(
   const d = block.rowDim;
   const O = block.outputDim;
   const act = actBpe(ctx);
-  // Formula: gather: tokens = T·g, hidden = d, vocabShard = ceil(rows/tp)
+  // Formula: gather: tokens = T·g, hidden = d, vocabShard = tableShardRows(block, ctx)
   // See docs/simulation-model.md §5 "n-gram embeddings"
   const gather: EmbeddingOp = {
     kind: 'embedding',
     name: `${block.name}.gather`,
     tokens: T * g,
     hidden: d,
-    vocabShard: Math.ceil(block.tableRows / ctx.parallel.tp),
+    vocabShard: tableShardRows(block, ctx),
     weight: lookupTableFormat(ctx),
     outputDtype: ctx.quant.activations,
   };
@@ -143,7 +287,9 @@ export function lowerNgram(
     const fetch = tableFetchOp(block, ctx, placement);
     if (fetch !== undefined) ops.push(fetch);
   }
-  ops.push(gather, ...tpAllReduce(`${block.name}.tp_all_reduce`, T * g, d, ctx));
+  if (ctx.lookupTables !== undefined && ctx.parallel.dp > 1)
+    ops.push(...sharedTableLookup(block, ctx, gather));
+  else ops.push(gather, ...tpAllReduce(`${block.name}.tp_all_reduce`, T * g, d, ctx));
   let projectedElems = 0;
   for (const p of block.projections) {
     ops.push(
@@ -172,20 +318,19 @@ export function lowerNgram(
 }
 
 /**
- * Bytes of an n-gram block's table shard on one device, `ceil(rows/tp)·d·bpe(lookup)`. Unit: bytes.
+ * Bytes of an n-gram block's table shard on one device: R_shard·d·bpe(lookup), R_shard from {@link tableShardRows}.
+ * Without sharing R_shard = ceil(rows/tp). Unit: bytes. See docs/simulation-model.md §5 "Lookup tables across DP".
  */
 export function ngramTableShardBytes(block: NgramEmbeddingBlock, ctx: LoweringContext): number {
-  // Formula: W_table = ceil(rows/tp)·d·bpe(lookup)
-  return (
-    Math.ceil(block.tableRows / ctx.parallel.tp) *
-    block.rowDim *
-    bytesPerElement(lookupTableFormat(ctx))
-  );
+  // Formula: W_table = tableShardRows(block, ctx)·d·bpe(lookup)
+  // See docs/simulation-model.md §5 "n-gram embeddings", "Lookup tables across DP".
+  return tableShardRows(block, ctx) * block.rowDim * bytesPerElement(lookupTableFormat(ctx));
 }
 
 /**
  * Bytes of an n-gram block's quantization scales on one device, `ceil(rows/tp)·scaleBytes(row)` (0 for a table
- * format without scales). Unit: bytes.
+ * format without scales). Sharing requires device-resident tables, so off-device pinned scales divide by TP only.
+ * Unit: bytes.
  */
 export function pinnedScaleBytes(block: NgramEmbeddingBlock, ctx: LoweringContext): number {
   const { scaleBytes } = tableRowBytes(lookupTableFormat(ctx), block.rowDim);
@@ -195,7 +340,7 @@ export function pinnedScaleBytes(block: NgramEmbeddingBlock, ctx: LoweringContex
 }
 
 /**
- * Resident weight bytes of an n-gram block on one device: the table shard `ceil(rows/tp)·d·bpe(lookup)` plus the
+ * Resident weight bytes of an n-gram block on one device: the shard from {@link ngramTableShardBytes} plus the
  * projections, vectors and conv taps (the weights of a one-token step without its gathered rows). A step's ops read
  * only the gathered rows, so this has its own formula, like MoE. With the table off-device ((`layerIndex` given and a
  * lookup-table placement), only the non-table part stays (design doc §2.7), plus, on unified memory
@@ -211,7 +356,7 @@ export function ngramResidentWeightBytes(
   const nonTable = lowerNgram(block, oneToken)
     .filter((op) => op.kind !== 'embedding')
     .reduce((sum, op) => sum + opBytes(op).weightBytes, 0);
-  // Formula: W = ceil(rows/tp)·d·bpe(lookup) + Σ weights(projections, gate vectors, conv taps)
+  // Formula: W = ngramTableShardBytes(block, ctx) + Σ weights(projections, gate vectors, conv taps)
   // Formula (table off-device): W = Σ weights(projections, gate vectors, conv taps)
   // Formula (off-device, unified, pinned_host): W = Σ weights(...) + ceil(rows/tp)·scaleBytes
   // See docs/simulation-model.md §8 "Memory fit", §12 ("Memory tiers")

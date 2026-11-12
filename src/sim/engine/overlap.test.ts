@@ -112,6 +112,8 @@ describe('overlapClassOf', () => {
     expect(overlapClassOf('tp')).toBe('tp');
     expect(overlapClassOf('etp')).toBe('tp');
     expect(overlapClassOf('dcp')).toBe('tp');
+    expect(overlapClassOf('dp')).toBe('tp');
+    expect(overlapClassOf('tp_dp')).toBe('tp');
     expect(overlapClassOf('ep')).toBe('ep');
     expect(() => overlapClassOf('pp')).toThrow(/pp-group collective inside a stage/);
   });

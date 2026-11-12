@@ -3,7 +3,8 @@
  *
  * Conventions (docs/simulation-model.md §5): `T = seqs · qLen` tokens per device step; TP shards heads and
  * intermediate widths (`Hl = heads / tp`; KV heads are replicated when `kvHeads < tp`); PP splits layers into
- * contiguous stages ({@link stageLayerRange}); DP replicas are independent and not lowered separately.
+ * contiguous stages ({@link stageLayerRange}); DP replicas are represented by one lowering, with cross-replica
+ * exchanges when EP spans them or lookup-table sharing is enabled.
  */
 
 import { opBytes } from '../ir/metrics';
@@ -37,6 +38,11 @@ export interface LoweringContext {
   quant: QuantConfig;
   /** Parallelism degrees. */
   parallel: ParallelConfig;
+  /** Resolved target lookup-table sharing; absent = the existing per-replica path. */
+  lookupTables?: {
+    /** Head-layout tables may read peer HBM directly (TP1 in a supported fully connected NVLink domain). */
+    peerReads: boolean;
+  };
   /**
    * Resolved off-device placement (deployment `offload`, design doc §2.1); absent = everything on the device, and
    * lowering emits no `TransferOp` (identity).

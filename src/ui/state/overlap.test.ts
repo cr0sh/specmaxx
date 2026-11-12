@@ -8,17 +8,27 @@ import { describe, expect, it } from 'vitest';
 import { mapHfModel } from '../../sim/models/hf/index';
 import { fixtureRepoFiles } from '../../sim/models/__fixtures__/fixtures.testutil';
 import { DEFAULT_STATE, normalizeOptions, reduce } from './appState';
-import { buildSimInput, loadedFromHf, REFERENCE_MODEL, type LoadedModel } from './buildInput';
+import {
+  buildDisaggregatedInput,
+  buildSimInput,
+  loadedFromHf,
+  REFERENCE_MODEL,
+  type LoadedModel,
+} from './buildInput';
 import { effectiveOptions, overlapClassesOf, twoBatchOverlapApplies } from './overlap';
 import { decodeState, encodeState } from './url';
 
 const ID = 'zai-org/GLM-5.3-Flash';
-function loadGlm(): LoadedModel {
-  const r = mapHfModel(fixtureRepoFiles(ID));
-  if (r.kind !== 'ok') throw new Error(`${ID}: ${r.kind}`);
-  return loadedFromHf({ kind: 'hf', id: ID }, r);
+function load(id: string): LoadedModel {
+  const r = mapHfModel(fixtureRepoFiles(id));
+  if (r.kind !== 'ok') throw new Error(`${id}: ${r.kind}`);
+  return loadedFromHf({ kind: 'hf', id }, r);
 }
-const GLM = loadGlm();
+const GLM = load(ID);
+const PLE_ID = 'Qwen/Qwen3.8-Flash-Next';
+const ENGRAM_ID = 'deepseek-ai/DeepSeek-V4.1-Flash';
+const PLE = load(PLE_ID);
+const ENGRAM = load(ENGRAM_ID);
 const DENSE = REFERENCE_MODEL.model;
 const RACK = `m=${ID}&d=gb200&n=72&b=72`;
 const EP72 = { tp: 1, pp: 1, dp: 72, ep: 72 };
@@ -86,6 +96,63 @@ describe('per-class overlap and two-batch overlap', () => {
       overlap: 'none',
     });
   });
+
+  it.each([
+    [PLE_ID, PLE, 'rtx-5090', 2, 2, true, true],
+    [PLE_ID, PLE, 'rtx-5090', 2, 2, false, false],
+    [PLE_ID, PLE, 'rtx-5090', 1, 1, true, false],
+    [PLE_ID, PLE, 'gb200', 72, 72, true, true],
+    [ENGRAM_ID, ENGRAM, 'rtx-5090', 2, 2, true, true],
+    [ENGRAM_ID, ENGRAM, 'gb200', 72, 72, true, false],
+    [ENGRAM_ID, ENGRAM, 'v100-sxm2', 8, 8, true, true, 'nvlink2-hybrid-cube-mesh-8-gpus'],
+    [ENGRAM_ID, ENGRAM, 'v100-sxm2', 4, 4, true, false, 'nvlink2-fully-connected-mesh-4-gpus'],
+  ] as const)(
+    'lookup overlap case %#: %s',
+    (id, model, device, n, dp, shared, active, linkId?: string) => {
+      const decoded = decodeState(
+        `m=${id}&d=${device}&n=${n}&dp=${dp}&b=${dp}&ovt=0${shared ? '&ltdp=1' : ''}${linkId ? `&il=${linkId}` : ''}`,
+      );
+      expect(decoded.dropped).toEqual([]);
+      const state = decoded.state;
+      const built = buildSimInput(state, model);
+      if (built.kind !== 'ok') throw new Error(JSON.stringify(built.issues));
+      expect(built.input.options?.overlapByClass).toEqual(active ? { tp: 0 } : undefined);
+      // A hidden override stays in the URL for when the class applies again, but cannot affect this input.
+      expect(encodeState(state)).toContain('ovt=0');
+    },
+  );
+
+  it.each([
+    [1, 2],
+    [2, 1],
+  ])(
+    'PD keeps the TP-class lookup override with prefill DP %i / decode DP %i',
+    (prefillDp, decodeDp) => {
+      const base = decodeState(
+        `m=${PLE_ID}&d=rtx-5090&n=${prefillDp}&dp=${prefillDp}&b=2&ltdp=1&ovt=0`,
+      ).state;
+      let state = reduce(base, { type: 'setDisaggregation', on: true });
+      state = reduce(state, {
+        type: 'inPool',
+        pool: 'decode',
+        action: { type: 'setCounts', devicesPerNode: decodeDp },
+      });
+      state = reduce(state, {
+        type: 'inPool',
+        pool: 'decode',
+        action: { type: 'setParallel', parallel: { tp: 1, dp: decodeDp } },
+      });
+      const built = buildDisaggregatedInput(state, PLE);
+      if (built?.kind !== 'ok') throw new Error(JSON.stringify(built?.issues));
+      expect(built.prefill.input.options?.overlapByClass).toEqual(
+        prefillDp > 1 ? { tp: 0 } : undefined,
+      );
+      expect(built.decode.input.options?.overlapByClass).toEqual(
+        decodeDp > 1 ? { tp: 0 } : undefined,
+      );
+      expect(built.input.shared.options?.overlapByClass).toEqual({ tp: 0 });
+    },
+  );
 
   it('the SimInput carries them only where they apply; absent choices give the input from before', () => {
     const build = (q: string) => {

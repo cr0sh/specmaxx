@@ -548,10 +548,11 @@ function elementwiseBytes(op: ElementwiseOp): ByteBreakdown {
 
 /** Memory traffic of an embedding gather: one table row per token read, one activation row written. Unit: bytes. */
 function embeddingBytes(op: EmbeddingOp): ByteBreakdown {
-  // Formula: W = tokens·hidden·bpe(w) (gathered rows, conservative); write = tokens·hidden·bpe(out)
-  // See docs/simulation-model.md §3 "Embedding"
+  // Formula: W = (rowsRead ?? tokens)·hidden·bpe(w); write = tokens·hidden·bpe(out)
+  // Shared masked lookups separate fetched rows from output rows; absent rowsRead keeps the conservative gather.
+  // See docs/simulation-model.md §3 "Embedding", §5 "Lookup tables across DP".
   return breakdown({
-    weightBytes: op.tokens * op.hidden * bytesPerElement(op.weight),
+    weightBytes: (op.rowsRead ?? op.tokens) * op.hidden * bytesPerElement(op.weight),
     activationReadBytes: 0,
     activationWriteBytes: op.tokens * op.hidden * bpeOf(op.outputDtype),
     kvReadBytes: 0,

@@ -452,15 +452,17 @@ These only feed the vector time; elementwise ops are memory-bound in practice.
 
 ### Embedding
 
-`metrics.ts: embeddingBytes`. `F = 0`; weights `tokens·hidden·bpe(w)` (gathered rows, conservative); write
-`tokens·hidden·bpe(out)`.
+`metrics.ts: embeddingBytes`. `F = 0`; weights `(rowsRead ?? tokens)·hidden·bpe(w)`; write
+`tokens·hidden·bpe(out)`. `rowsRead` is the number of table rows fetched by one device in one step; absent keeps
+the conservative gather. Masked shared lookups can fetch fewer rows than they output (§5 "Lookup tables across DP").
 
 ### Collective
 
 No FLOP, no memory traffic (`opBytes` returns zeros); its time is `messageBytes` through the alpha-beta model
 (§6). Its `group` is `tp`, `ep`, `pp`, `etp` (expert TP, §5 "MoE modes A/B") or `dcp` (the d consecutive ranks of
 a TP group sharing a token-sharded KV cache, §5 [Decode context parallelism (DCP)](#decode-context-parallelism-dcp)),
-and the group selects the path (`engine/opTime.ts: OpTimeContext.collectivePaths`).
+or `dp` / `tp_dp` for shared lookup tables (strided DP / contiguous TP×DP, §5 "Lookup tables across DP").
+The group selects the path (`engine/opTime.ts: OpTimeContext.collectivePaths`).
 
 ### Transfer
 
@@ -998,6 +1000,19 @@ costed in §6
   equal to `devicesPerNode`, every path keeps the topology's own link object, so results are bit-identical. Only with
   `interNode`, `nodes > 1` and a switched fabric; N_nic must divide `devicesPerNode` or be a multiple of it
   (`validateTopology`). The IB link names keep "(one NIC per GPU)": they are URL ids (`linkPresetId`).
+- **Full peer-domain capability** (`src/sim/hw/types.ts: LinkSpec.fullyConnectedDevices`;
+  `engine/placement.ts:lookupTablesUsePeerReads`): the largest fully connected device domain established for the
+  link profile, including self. A sourced safe integer ≥ 2 (`hw/validate.ts:validateLink`), not a neighbour count
+  and not a generic NVLink-generation limit. The A100/H100/B200 switched profiles establish 8 devices; the
+  explicit NVL72 profile establishes 72; the V100 full mesh establishes 4; the RTX3090/A100/V100 pairs establish 2.
+  `devicesPerNode` must fit that size: using only a small DP group does not certify an oversized modeled domain.
+  Missing means unknown or partial connectivity, so use lookup collectives instead of peer-HBM reads. HCM has
+  no full-connectivity claim, even for subgroups whose adjacency is not modeled; NVL4's inferred mesh likewise
+  makes no claim, and must not inherit the switched profile's capability. CPU–GPU C2C is not a GPU peer domain.
+  `p2p: 'direct'` and NVLS are independent properties and do not establish this capability. Existing collective
+  costs do not use it; absent sharing/DP1 behavior is unchanged. Sources live on the link presets; tests cover
+  profile sizes, missing metadata and HCM fallback in `engine/placement.test.ts`, `engine/dp.test.ts` and
+  `hw/validate.test.ts`.
 - **In-network reduction capability** (`src/sim/hw/types.ts: LinkSpec.inNetworkReduction, InNetworkReduction`;
   §6 "In-network reduction (NVLS, SHARP)"): the switch of a link level that reduces all-reduce data itself. A
   capability flag cited in the link's `sources[]` (field `inNetworkReduction`), pinned by `links.test.ts`:
@@ -1369,8 +1384,55 @@ forward pass, like activations). A PP boundary carries the running sum AND the s
 3. `ngram_gate` over `T·O`: read the projection outputs and the stream, write the stream.
 4. With `conv`: dilated `causal_conv1d` over `T·O`, state `(K−1)·dilation·O·bpe(act)`.
 
-Resident weights have their own formula (a step reads only the gathered rows): `ceil(rows/tp)·rowDim·bpe(lookup)` +
-projections + vectors + conv taps.
+Resident weights have their own formula (a step reads only the gathered rows): `R_shard·rowDim·bpe(lookup)` +
+projections + vectors + conv taps. `R_shard = ceil(rows/tp)` without sharing; with sharing it comes from
+`lower/ngram.ts:tableShardRows` below.
+
+#### Lookup tables across DP
+
+Code: `lower/ngram.ts:sharedTableLookup, tableShardRows, ngramTableShardBytes`;
+`engine/placement.ts:lookupTableCollectivePaths, lookupTablesUsePeerReads`;
+`engine/opTime.ts:memoryOnlyOpTime`; `engine/memory.ts:stageActivationPeakBytes`.
+
+`deployment.offload.lookupTables = { acrossDp: true, placements? }` shares target n-gram tables. Missing
+placements = Device; legacy `rule | rule[]` inputs remain valid. Only Device permits sharing: UI changes to RAM,
+SSD or mixed placement clear the flag; direct invalid engine inputs are rejected. Expert/embedding offload is
+independent, as is KV-cache placement (including prefix-only offload and the remote pool). Sharing alone needs no
+offload host; `engine/offloadRules.ts:hasOffDevicePlacement, kvCacheMovesAnything` distinguish it from a real tier
+placement. Absent/false or DP 1 keeps existing results; URL: `ltdp=1`.
+
+Distribution follows vLLM [Engram](https://github.com/vllm-project/vllm/blob/7c9a2fa2b3c9e012384fecd40f50c614016e1d35/vllm/models/deepseek_v41/common/engram.py)
+and [PLE](https://github.com/vllm-project/vllm/blob/7c9a2fa2b3c9e012384fecd40f50c614016e1d35/vllm/models/qwen4_exp/common/ngram_embedding.py).
+With `D = dp`, local tokens T, g rows/token, row width d, a activation bytes/element, r = max(a, 2) reduction
+bytes/element, and I the gathered ID bytes per device:
+
+- **Engram:** `h = ceil(g/(tp·D))` contiguous hash heads per rank; resident bytes use the largest sum of actual
+  head buckets, not total rows divided by tp·D. DP gathers int32 IDs (`4·T·D·g` bytes), each rank reads `T·D·h`
+  rows, DP gathers results (`T·D²·h·d·a` bytes), selects local tokens, then TP gathers heads (`T·D·tp·h·d·a`).
+- **Engram TP 1, fully connected direct NVLink domain within its supported size (§4):** row shards; each gather
+  serves T·g rows under uniform ownership, with remote
+  payload `T·g·rowBytes·(D−1)/D`. Its memory time is `max(HBM service, remote payload / B_link)`. No extra op,
+  collective or dispatch. Remote-load latency, headers and routing skew are unmeasured and excluded (warning).
+- **PLE:** `ceil(tableRows/(tp·D))` resident rows; DP gathers int64 IDs (`8·T·D·g` bytes), reads `T·g/tp` owned
+  rows into a masked full-token output in the reduction format, then TP×DP all-reduces `T·D·g·d·r` bytes.
+  The buffers and wire format are at least 16-bit even with FP8 activations (§5 "Reductions dtype"). Local selection
+  is a view.
+
+Workspace is capacity, not additional HBM traffic: IDs retain `I + T·g·idBytes`. PLE retains
+`I + 2·T·D·g·d·r`. For Engram let `S = T·D·h·d·a` and `E = T·D·h·d`: the DP row exchange peak is
+`I + S + D·S + E·a`, the select copy reads and writes `E·a` each, and the TP exchange peak is
+`I + S + (tp+1)·E·a`.
+
+DP peers are strided by TP; TP×DP is contiguous. Paths inherit the existing host staging, multi-NIC sharing and
+in-network reduction option via `collectivePath`. Engram currently requires all replicas in one modeled node:
+a scale-up domain, not necessarily one physical server (NVL72 is one node). Partial use of that domain need not
+tile its unused devices. Missing or insufficient `fullyConnectedDevices` selects the head-sharded collective
+path instead of peer reads; its empty-head-owner checks still apply. Validation and simulation use the same
+predicate on modified links, and UI overlap applicability follows it too. Subgroups within multi-domain runs
+and empty head owners are rejected. Exchanges are per layer with balanced token slots; runtime padding and async prefetch are excluded.
+Live exchange buffers enter the existing activation peak (decode/verify and last prefill chunk). Selection copies
+remain under ideal fusion (`opTime.ts:opTimeByKind` uses their explicit read/write bytes, with zero FLOP); collective HBM traffic follows §6. Projections, sequence state, drafter tables and
+pipeline throughput formulas are unchanged.
 
 ### Short convs
 
@@ -1827,7 +1889,8 @@ chunks of C tokens instead of whole; the split and the sends per token are as ab
 
 ### DP
 
-DP replicas are independent and not lowered separately: `B_r = batch/dp` (must divide), aggregate tok/s = dp ×
+DP replicas are independent unless lookup-table sharing is enabled (above), and not lowered separately:
+`B_r = batch/dp` (must divide), aggregate tok/s = dp ×
 the per-replica rate, per-sequence rates unchanged (§7 "Pipeline and DP").
 
 ### Rank layout
@@ -2346,8 +2409,8 @@ One exhaustive switch on `op.kind`. `memBW = min(memory.bandwidthBytesPerSec, en
 | gemm                                             | `t_mma`; with `m ≤ gemvMaxRows` (dense, fp16 / bf16 / fp32 math) `min(t_mma, F / vectorPeak(math))` (§4 "GEMV path")                                                                                  | `bytes/memBW`                                                                                                                                     |
 | attention                                        | `max(t_mma, t_exp + t_vec)` with `t_exp = S / sfuOpsPerSec`, `t_vec = 5·S / vectorPeak(fp32)` ("Attention softmax" below)                                                                             | `bytes/memBW`                                                                                                                                     |
 | recurrent (step), elementwise                    | `F / vectorPeak(dtype)` (state dtype for the step)                                                                                                                                                    | `bytes/memBW`                                                                                                                                     |
-| embedding                                        | 0                                                                                                                                                                                                     | `bytes/memBW`                                                                                                                                     |
-| collective                                       | §6 on the group's path (TP group, EP group, or this stage's PP boundary)                                                                                                                              | —                                                                                                                                                 |
+| embedding                                        | 0                                                                                                                                                                                                     | `bytes/memBW`; shared peer gather: `max(bytes/memBW, peerReadBytes/B_peer)`                                                                       |
+| collective                                       | §6 on the group's path (`tp`, `ep`, `etp`, `dcp`, lookup `dp`/`tp_dp`, or the PP boundary)                                                                                                            | —                                                                                                                                                 |
 | transfer (off-device read, deployment `offload`) | —                                                                                                                                                                                                     | the tier/link model of §12 (latency `transferLatencySec` + service `transferBandwidthSec`); `bound = 'transfer'`. No FLOP, no device-memory bytes |
 
 `t = max(compute, memory)`; the larger term is the op's `bound` (a tie counts as compute). A tensor op whose
@@ -2477,11 +2540,17 @@ overlapped time of §12 "Overlap across tiers" (`pipeline.ts: stageTransfer`).
 
 **Overlap classes.** Each collective belongs to one class by its parallel group (`overlap.ts: overlapClassOf`):
 
-| Class | Groups              | Collectives                                                                                 |
-| ----- | ------------------- | ------------------------------------------------------------------------------------------- |
-| `tp`  | `tp`, `etp`, `dcp`  | TP all-reduces / all-gathers, expert-TP pairs, decode context-parallel exchanges            |
-| `ep`  | `ep`                | MoE mode B dispatch / combine all-to-alls; with DP attention the dense gathers and head A2A |
-| `pp`  | `pp` (`sendToNext`) | the activation send to the next stage                                                       |
+| Class | Groups                            | Collectives                                                                                 |
+| ----- | --------------------------------- | ------------------------------------------------------------------------------------------- |
+| `tp`  | `tp`, `etp`, `dcp`, `dp`, `tp_dp` | TP, expert-TP, decode context-parallel and shared lookup-table exchanges                    |
+| `ep`  | `ep`                              | MoE mode B dispatch / combine all-to-alls; with DP attention the dense gathers and head A2A |
+| `pp`  | `pp` (`sendToNext`)               | the activation send to the next stage                                                       |
+
+Lookup exchanges use the same `tp` overlap class as the unshared lookup's TP all-reduce; there is no separate
+lookup overlap setting. The existing `ovt` URL key controls them. The UI keeps this class active at TP 1 when
+sharing emits collectives (`ui/state/overlap.ts:hasLookupCollectives, overlapClassesOf, effectiveOptions`), using
+the edited pool's resolved topology. Peer-HBM gathers remain memory operations and do not activate the class.
+Under PD disaggregation the shared options retain the union of both pools' active classes (`buildInput.ts:poolsShared`).
 
 `bw_c,s` = Σ β of the class-c collectives of stage s. A `pp` collective inside a stage's layers is an invariant
 violation (it throws). Each class has an **overlap fraction** `f_c ∈ [0, 1]`: the share of its β time that may run
@@ -2895,7 +2964,7 @@ Per device of stage s:
 
 - `W_s` = Σ resident block weights (non-MoE blocks: the weight bytes of a one-token lowering, so resident and
   streamed weights agree by construction; MoE: all local experts, plus `r·W_expert` EPLB replicas at ep > 1 (§5
-  "Redundant experts"); n-gram: the table shard `ceil(rows/tp)·d·bpe(lookup)`
+  "Redundant experts"); n-gram: the table shard `tableShardRows(block, ctx)·d·bpe(lookup)` (§5 "Lookup tables across DP")
   plus its projections and vectors) + the embedding shard on stage 0 while it is on the device
   (`[s = 0 ∧ on device] W_emb`, `W_emb = ceil(vocab/tp)·h·bpe(emb)`; §12 "Token embedding off-device") + the LM-head
   shard and final norm on the last stage (`W_head = ceil(vocab/G)·h·bpe(head) + norm`, G = tp, or ep with
@@ -2912,7 +2981,8 @@ Per device of stage s:
   owned indexer keys `ceil(ctx/p)·hd_I·bpe(key)` (0 for `reuse` and `ownsKeys: false`); linear attention
   `vL·dk·dv·bpe(state) + C·(K−1)·bpe(act)`; short conv `(K−1)·dim·bpe(act)`; n-gram conv
   `(K−1)·dilation·O·bpe(act)`; hyper-connections 0.
-- `act_s` = the largest activation read + write of any single op of the stage over the decode step and the LAST
+- `act_s` = the largest of an op's activation read + write and its explicit lookup-exchange `workspaceBytes`
+  (absent = 0) over the decode step and the LAST
   prefill chunk (see "Activation peak" below): the transient inputs and outputs of the op running.
 - `reserve` = the runtime reserve per device (`HardwareStack.runtimeReserveBytes`, default 0; see "Runtime
   reserve").
@@ -2983,6 +3053,14 @@ stage's total. No vendor publishes it, and it depends on the engine and driver, 
 ---
 
 ## 9. Deliberately excluded, and approximations
+
+Shared lookup tables (§5): the current Engram row all-gather plus selection and PLE masked all-reduce model
+exchange algorithms, not minimum payloads. Engram can exchange only the required rows with all-to-all; PLE can
+scatter reduced outputs instead of replicating the full DP-token buffer. Fewer bytes do not guarantee lower modeled
+time: existing reduce-scatter uses ring phases, whereas all-reduce can use NVLS/SHARP. Peer-HBM reads are synchronous
+work inside the embedding gather, not independently overlap-able collectives. Their remote-load latency and
+transaction overhead are excluded. Shared TP row ownership is more precise than the unchanged conservative
+unshared gather, so at TP > 1 the on/off difference is not solely the effect of DP sharing.
 
 Excluded on purpose (only hardware and math limits are modeled):
 
@@ -3252,7 +3330,7 @@ to move**:
   each step, which hid the much cheaper expert offload. Partial offload of dense layers would come back as the
   CPU-compute mode (`OffloadConfig.mode 'cpu_compute'`, review F3), not as streaming. Validation rejects an input
   that still carries `denseLayers`.
-- **Rules by layer range** (mixed placement, design doc §2.11): `routedExperts` and `lookupTables` each take one
+- **Rules by layer range** (mixed placement, design doc §2.11): `routedExperts` and `lookupTables.placements` each take one
   rule or a list of rules over disjoint layer ranges, e.g. experts of layers 0–23 in host RAM and 24–47 on the SSD, or
   Engram's table of layer 1 in RAM and layer 14 on the SSD. The single object is the one-rule list (`offloadRules.ts`);
   `[]` offloads nothing. `resolveOffload` sorts the rules by `layers.from` (list order never changes a result),

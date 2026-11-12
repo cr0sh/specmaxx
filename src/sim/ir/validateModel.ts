@@ -175,6 +175,15 @@ function blockErrors(model: ModelSpec, i: number, block: BlockSpec): string[] {
           `${at}: outputDim ${block.outputDim} must equal residualStreams·hidden ${streams * model.hidden}`,
         ];
       }
+      if (
+        block.headRows !== undefined &&
+        (block.headRows.length !== block.rowsPerToken ||
+          block.headRows.some((n) => !Number.isSafeInteger(n) || n < 1) ||
+          block.headRows.reduce((a, b) => a + b, 0) > block.tableRows)
+      )
+        return [
+          `${at}: headRows must contain rowsPerToken positive row counts whose sum does not exceed tableRows`,
+        ];
       return [];
     case 'moe':
       if (

@@ -52,7 +52,9 @@ export interface OpTimeContext {
    * expert-TP group (`placement.ts: expertTpCollectivePath`), and the decode context-parallel group (the d
    * consecutive ranks of a TP group, `collectivePath(groupSpan(dcp))`). `etp` is set only when the model lowers
    * expert-TP collectives (a MoE `expertOutputNorm` with etp > 1), `dcp` only when the phase lowers DCP collectives
-   * (`parallel.dcp` > 1, decode); an `etp` or `dcp` op without its path is an error.
+   * (`parallel.dcp` > 1, decode). Shared lookup tables add `dp` (strided) and `tp_dp` (contiguous), from
+   * `placement.ts:lookupTableCollectivePaths`. Any collective without its group's path is an error.
+   * See docs/simulation-model.md §5 "Lookup tables across DP".
    */
   collectivePaths: {
     tp: CollectivePath;
@@ -60,6 +62,8 @@ export interface OpTimeContext {
     pp: CollectivePath;
     etp?: CollectivePath;
     dcp?: CollectivePath;
+    dp?: CollectivePath;
+    tp_dp?: CollectivePath;
   };
   /** All-reduce algorithm (SimOptions.collectiveAlgorithm). */
   collectiveAlgorithm: AllReduceAlgorithm;
@@ -160,10 +164,11 @@ function opTimeByKind(op: Op, ctx: OpTimeContext): OpResult {
         ? tensorOpTime(op, recurrentChunkShape(op), op.math, op.accumulate, 'dense', ctx)
         : vectorOpTime(op, op.stateDtype, opBytes(op), ctx);
     case 'elementwise':
+      // Lookup selection copies are materialized data movement, not fusible arithmetic.
       return vectorOpTime(
         op,
         op.dtype,
-        elementwiseBytesUnderFusion(op, ctx.elementwiseFusion),
+        op.fn === 'copy' ? opBytes(op) : elementwiseBytesUnderFusion(op, ctx.elementwiseFusion),
         ctx,
       );
     case 'embedding':
@@ -401,9 +406,18 @@ function vectorOpTime(
 /** An embedding gather: no FLOP, memory time only. */
 function memoryOnlyOpTime(op: Op, ctx: OpTimeContext): OpResult {
   const bytes = opBytes(op);
-  // Formula: t = bytes / memBW
-  // See docs/simulation-model.md §7 ("Per-op time")
-  const memorySec = bytes.totalBytes / ctx.memBandwidthBytesPerSec;
+  // Formula: t = max(bytes/memBW, peerReadBytes/B_peer); absent peerReadBytes = bytes/memBW unchanged.
+  // See docs/simulation-model.md §7 "Per-op time", §5 "Lookup tables across DP".
+  let memorySec = bytes.totalBytes / ctx.memBandwidthBytesPerSec;
+  if (op.kind === 'embedding' && op.peerReadBytes !== undefined) {
+    const path = ctx.collectivePaths.dp;
+    if (path?.kind !== 'flat' || path.level !== 'intra') {
+      throw new Error(`peer lookup '${op.name}' needs a flat intra-node DP path`);
+    }
+    // One gather kernel: max(HBM service, peer bytes / fabric bandwidth), not another collective or launch.
+    // Remote-load latency is unmeasured; this is a bandwidth ceiling, not a collective's α.
+    memorySec = Math.max(memorySec, op.peerReadBytes / path.link.bandwidthPerDirectionBytesPerSec);
+  }
   return {
     op,
     flops: 0,

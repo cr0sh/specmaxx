@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { decoderLayer, decoderModel, type HcPreParams, type MixerParams } from './builders';
 import type { IndexerSpec, ModelSpec } from './model';
 import { modelSpecErrors } from './validateModel';
-import { REF_DENSE_8B, TINY_HYBRID, TINY_MLA_SPARSE } from '../models/reference';
+import { REF_DENSE_8B, TINY_HC_NGRAM, TINY_HYBRID, TINY_MLA_SPARSE } from '../models/reference';
 
 const INDEXER: IndexerSpec = { heads: 2, headDim: 16, topK: 32 };
 
@@ -60,6 +60,33 @@ describe('modelSpecErrors', () => {
   it('accepts the reference models', () => {
     for (const m of [REF_DENSE_8B, TINY_HYBRID, TINY_MLA_SPARSE])
       expect(modelSpecErrors(m)).toEqual([]);
+  });
+
+  it('lookup head rows match the head count, use positive safe integers and fit in the table', () => {
+    const errors = (headRows: number[]) =>
+      modelSpecErrors({
+        ...TINY_HC_NGRAM,
+        layers: TINY_HC_NGRAM.layers.map((layer) => ({
+          ...layer,
+          blocks: layer.blocks.map((b) => (b.kind === 'ngram_embedding' ? { ...b, headRows } : b)),
+        })),
+      });
+    expect(errors([249, 250, 250, 251])).toEqual([]);
+    for (const headRows of [
+      [1],
+      [0, 1, 1, 1],
+      [-1, 1, 1, 1],
+      [1.5, 1, 1, 1],
+      [Infinity, 1, 1, 1],
+      [Number.MAX_SAFE_INTEGER + 1, 1, 1, 1],
+      [1000, 1, 1, 1],
+    ]) {
+      expect(
+        errors(headRows).some((e) =>
+          e.includes('headRows must contain rowsPerToken positive row counts'),
+        ),
+      ).toBe(true);
+    }
   });
 
   it('MLA kvCacheFromLayer: earlier owner with the same rkv and dr (Mistral Large 4)', () => {

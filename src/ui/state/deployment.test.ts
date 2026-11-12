@@ -52,6 +52,21 @@ const FLASH_STATE: AppState = {
 };
 
 describe('deployment normalizers', () => {
+  it('a sharing URL on a model without tables explains sharing, not placement', () => {
+    const state = reduce(DEFAULT_STATE, {
+      type: 'setOffload',
+      offload: { tables: { acrossDp: true } },
+    });
+    const built = buildSimInput(state, BUNDLED_DEFAULT_MODEL);
+    expect(built.kind).toBe('ok');
+    expect(built.issues).toContainEqual({
+      field: 'offload',
+      level: 'warning',
+      message: 'The model has no n-gram lookup tables; sharing has no effect.',
+    });
+    if (built.kind === 'ok') expect(built.input.deployment?.offload?.lookupTables).toBeUndefined();
+  });
+
   it('drop default values, and drop a queue depth when nothing is offloaded', () => {
     expect(
       normalizeOffload({
@@ -373,7 +388,9 @@ describe('buildSimInput: deployment', () => {
         ds,
       );
       if (built.kind !== 'ok') throw new Error(JSON.stringify(built.issues));
-      return built.input.deployment?.offload?.lookupTables;
+      const policy = built.input.deployment?.offload?.lookupTables;
+      expect(policy).toHaveProperty('placements');
+      return policy !== undefined && 'placements' in policy ? policy.placements : undefined;
     };
     // 1 of the 2 table layers in host RAM (the default half): the boundary is the 2nd table layer, 14.
     expect(tables({ tier: 'split', scaleLayout: 'interleaved' })).toEqual([
@@ -403,6 +420,82 @@ describe('buildSimInput: deployment', () => {
       { tier: 'host_ram', layers: { from: 0, to: 14 }, scaleLayout: 'separate' },
       { tier: 'nvme', layers: { from: 14, to: L }, scaleLayout: 'separate' },
     ]);
+  });
+
+  it.each(['host_ram', 'nvme', 'remote_pool'] as const)(
+    'shared tables preserve the selected host for KV-only %s offload',
+    (tier) => {
+      const s = reduce(FLASH_STATE, {
+        type: 'setOffload',
+        offload: {
+          tables: { acrossDp: true },
+          kvCache: {
+            tier,
+            deviceFraction: 0.5,
+            ...(tier === 'remote_pool' ? { poolLinkId: 'infiniband-hdr200-one-nic-per-gpu' } : {}),
+          },
+          queueDepth: 8,
+        },
+      });
+      const built = buildSimInput(s, FLASH);
+      expect(built.kind).toBe('ok');
+      if (built.kind !== 'ok') throw new Error(JSON.stringify(built.issues));
+      expect(built.input.hardware.host).toBeDefined();
+      expect(built.input.deployment?.offload?.kvCache?.deviceFraction).toBe(0.5);
+      expect(built.input.deployment?.offload?.queueDepth).toBe(8);
+      expect(built.input.deployment?.offload?.lookupTables).toEqual({ acrossDp: true });
+    },
+  );
+
+  it('shared tables with prefix-only KV offload resolve a host only for a cache-hit workload', () => {
+    const state = reduce(FLASH_STATE, {
+      type: 'setOffload',
+      offload: {
+        tables: { acrossDp: true },
+        kvCache: { tier: 'host_ram', prefixDeviceFraction: 0.25 },
+      },
+    });
+    for (const hit of [0, 0.5]) {
+      const built = buildSimInput(
+        { ...state, workload: { ...state.workload, prefixCacheHitRatio: hit } },
+        FLASH,
+      );
+      expect(built.kind).toBe('ok');
+      if (built.kind !== 'ok') throw new Error(JSON.stringify(built.issues));
+      expect(built.input.hardware.host !== undefined).toBe(hit > 0);
+    }
+  });
+
+  it('shared device tables survive normalization without a host and are not auto-offloaded with experts', () => {
+    const shared = { tables: { acrossDp: true } };
+    const s = reduce(FLASH_STATE, {
+      type: 'setOffload',
+      offload: shared,
+      tablesOffDeviceByDesign: true,
+    });
+    expect(s.deployment.offload).toEqual(shared);
+    expect(
+      normalizeOffload({ ...shared, queueDepth: 8, prefetchAccuracy: 1, ssdReadRate: 'sustained' }),
+    ).toEqual(shared);
+    const built = buildSimInput(s, FLASH);
+    if (built.kind !== 'ok') throw new Error(JSON.stringify(built.issues));
+    expect(built.input.deployment?.offload).toEqual({ lookupTables: { acrossDp: true } });
+    expect(built.input.hardware.host).toBeUndefined();
+    expect(offloadsAnything(s.deployment.offload)).toBe(false);
+    const experts = reduce(s, {
+      type: 'setOffload',
+      offload: { ...shared, experts: { tier: 'host_ram' } },
+      tablesOffDeviceByDesign: true,
+    });
+    expect(experts.deployment.offload?.tables).toEqual({ acrossDp: true });
+    expect(normalizeOffload({ tables: { acrossDp: false } })).toEqual({});
+    for (const tier of ['host_ram', 'nvme', 'split'] as const) {
+      const moved = reduce(s, {
+        type: 'setOffload',
+        offload: { tables: { tier, acrossDp: true } },
+      });
+      expect(moved.deployment.offload?.tables).toEqual({ tier });
+    }
   });
 
   it('MTP on the default model uses its head, the default k and the prose preset', () => {

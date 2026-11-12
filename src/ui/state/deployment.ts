@@ -65,10 +65,10 @@ export function splitTierRanges(
  */
 export type HitRatioChoice = 'uniform' | 'skewed_classic' | 'skewed_fine_grained' | number;
 
-/** Layout of a block-scaled table's scales (engine `lookupTables.scaleLayout`). */
+/** Layout of a block-scaled table's scales (engine `lookupTables.placements[].scaleLayout`). */
 export type ScaleLayoutChoice = 'separate' | 'pinned_host' | 'interleaved';
 
-/** Weight offloading choices; `{}` = everything on the device. */
+/** Storage placement and lookup-table sharing choices; `{}` = device-resident, unshared tables. */
 export interface OffloadChoice {
   /** Routed experts of MoE layers kept on a tier; absent = on the device. */
   experts?: {
@@ -83,10 +83,12 @@ export interface OffloadChoice {
     /** Hit-ratio model; absent = `'uniform'`. */
     hitRatio?: HitRatioChoice;
   };
-  /** n-gram lookup tables (Qwen PLE, DeepSeek Engram) on a tier; absent = on the device. */
+  /** n-gram lookup-table placement and sharing; absent = device-resident, one copy per DP replica. */
   tables?: {
-    /** Tier holding the tables, or `'split'` between host RAM and the SSD by table layer (see `split`). */
-    tier: PlacementChoice;
+    /** Absent = device; else the storage tier or a host-RAM / SSD split by table layer. */
+    tier?: PlacementChoice;
+    /** Share device-resident tables across DP replicas; absent/false = off. */
+    acrossDp?: boolean;
     /**
      * With `tier: 'split'`: how the layers that have a table split (`ramLayers` counts table layers, not all layers);
      * absent = the default split.
@@ -195,7 +197,7 @@ export interface SpecDecChoice {
 
 /** The deployment-scenario choices; `{}` = every knob off. */
 export interface DeploymentChoice {
-  /** Weight offloading; absent or `{}` = off. */
+  /** Storage placement and lookup-table sharing; absent or `{}` = defaults. */
   offload?: OffloadChoice;
   /** Speculative decoding; absent = off. */
   specDec?: SpecDecChoice;
@@ -233,7 +235,7 @@ export function offloadsAnything(offload: OffloadChoice | undefined): boolean {
   return (
     offload !== undefined &&
     (offload.experts !== undefined ||
-      offload.tables !== undefined ||
+      offload.tables?.tier !== undefined ||
       offload.embeddings !== undefined ||
       offload.kvCache !== undefined)
   );
@@ -296,7 +298,7 @@ function normalizeSplit(
 /**
  * The offload choice with defaults removed (fromLayer 0, f 0, uniform h, a single tier's scale layout, a split without
  * `tier: 'split'`, `ramEnd` `'first'`) and a queue depth and a prefetch accuracy (without the default 0.8) kept only
- * while something is offloaded; `{}` when nothing is.
+ * while something is offloaded. Device-only table sharing survives, without any host/offload tuning knobs.
  */
 export function normalizeOffload(o: OffloadChoice): OffloadChoice {
   const experts =
@@ -308,17 +310,21 @@ export function normalizeOffload(o: OffloadChoice): OffloadChoice {
       residentFraction: o.experts.residentFraction === 0 ? undefined : o.experts.residentFraction,
       hitRatio: o.experts.hitRatio === 'uniform' ? undefined : o.experts.hitRatio,
     });
+  const tableTier = o.tables?.tier;
   const tables =
-    o.tables &&
-    compact({
-      tier: o.tables.tier,
-      split: normalizeSplit(o.tables.tier, o.tables.split),
-      // A split has no single default layout (each side uses its tier's), so its layout is kept as given.
-      scaleLayout:
-        o.tables.tier !== 'split' && o.tables.scaleLayout === defaultScaleLayout(o.tables.tier)
-          ? undefined
-          : o.tables.scaleLayout,
-    });
+    tableTier === undefined
+      ? o.tables?.acrossDp === true
+        ? { acrossDp: true }
+        : undefined
+      : compact({
+          tier: tableTier,
+          split: normalizeSplit(tableTier, o.tables?.split),
+          // Moving tables off-device clears DP sharing; the remaining offload knobs retain their meaning.
+          scaleLayout:
+            tableTier !== 'split' && o.tables?.scaleLayout === defaultScaleLayout(tableTier)
+              ? undefined
+              : o.tables?.scaleLayout,
+        });
   const embeddings = o.embeddings && { tier: o.embeddings.tier };
   const kvCache = normalizeKvCache(o.kvCache);
   const out = compact({ experts, tables, embeddings, kvCache });
@@ -331,7 +337,7 @@ export function normalizeOffload(o: OffloadChoice): OffloadChoice {
         ssdReadRate: offloadsToSsd(out) && o.ssdReadRate === 'sustained' ? 'sustained' : undefined,
         prefetchAccuracy,
       })
-    : {};
+    : out;
 }
 
 /** The spec-dec choice with defaults removed (use case `'prose'`; the use case while α is set). */
@@ -349,7 +355,7 @@ export function normalizeSpecDec(s: SpecDecChoice): SpecDecChoice {
 export function normalizeDeployment(d: DeploymentChoice): DeploymentChoice {
   const offload = d.offload && normalizeOffload(d.offload);
   return compact({
-    offload: offload && offloadsAnything(offload) ? offload : undefined,
+    offload: offload && Object.keys(offload).length > 0 ? offload : undefined,
     specDec: d.specDec && normalizeSpecDec(d.specDec),
     twoBatchOverlap: d.twoBatchOverlap === true ? true : undefined,
   });

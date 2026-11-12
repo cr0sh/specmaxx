@@ -44,6 +44,7 @@
  * | `oxr`, `oxe` | (with `ox=split`) offloaded layers in host RAM, integer ≥ 0 (default: half, rounded down), which end is in host RAM: `last` (default `first`, never written) | `oxr=24&oxe=last` |
  * | `odl`, `odt` | legacy whole-layer offload (removed), read only: accepted and ignored, never written | `odl=40` |
  * | `olt`, `ols` | lookup-tables tier `ram`, `ssd`, `split` (host RAM + SSD) (absent: on the device); (with `olt`) scale layout `separate`, `pinned`, `interleaved` (default: the tier's; with `split`, each side's tier's) | `olt=ram` |
+ * | `ltdp` | lookup tables shared across DP: `1`; device placement only (absent: off) | `ltdp=1` |
  * | `olr`, `ole` | (with `olt=split`) layers with a table kept in host RAM, integer ≥ 0 (default: half, rounded down), which end is in host RAM: `last` (default `first`, never written) | `olr=24` |
  * | `oet` | token-embedding table tier `ram`, `ssd` (absent: on the device; `split` is not allowed) | `oet=ssd` |
  * | `okt` | KV-cache tier `ram`, `ssd`, `split` (host RAM + SSD), `pool` (remote KV pool over the network) (absent: the whole KV cache on the device) | `okt=ram` |
@@ -242,6 +243,7 @@ export const URL_KEYS = [
   'odt',
   'olt',
   'ols',
+  'ltdp',
   'oet',
   'okt',
   'okd',
@@ -516,11 +518,12 @@ export function encodeState(s: AppState): string {
     put('oxh', typeof h === 'number' ? h : h === undefined ? undefined : HIT_RATIO_KEYS[h]);
     putSplit(put, 'oxr', 'oxe', o.experts.split);
   }
-  if (o.tables !== undefined) {
+  if (o.tables?.tier !== undefined) {
     put('olt', PLACEMENT_KEYS[o.tables.tier]);
     if (o.tables.scaleLayout !== undefined) put('ols', SCALE_LAYOUT_KEYS[o.tables.scaleLayout]);
     putSplit(put, 'olr', 'ole', o.tables.split);
   }
+  if (o.tables?.acrossDp === true) put('ltdp', '1');
   if (o.embeddings !== undefined) put('oet', TIER_KEYS[o.embeddings.tier]);
   const kv = o.kvCache;
   if (kv !== undefined) {
@@ -713,6 +716,8 @@ function decodeDeployment(
   const tablesSplit = readSplit('olr', 'ole', tablesTier === 'split');
   if (tablesTier !== undefined)
     offload.tables = { tier: tablesTier, split: tablesSplit, scaleLayout };
+  const acrossDp = read('ltdp', tablesTier === undefined, (r) => (r === '1' ? true : undefined));
+  if (acrossDp === true) offload.tables = { acrossDp: true };
   const embeddingsTier = read('oet', true, (r) => keyOf(TIER_KEYS, r));
   if (embeddingsTier !== undefined) offload.embeddings = { tier: embeddingsTier };
   const kvTier = read('okt', true, (raw) => keyOf(KV_TIER_KEYS, raw));
@@ -745,7 +750,7 @@ function decodeDeployment(
   }
   const any =
     offload.experts !== undefined ||
-    offload.tables !== undefined ||
+    offload.tables?.tier !== undefined ||
     embeddingsTier !== undefined ||
     offload.kvCache !== undefined;
   offload.queueDepth = read('oqd', any, (r) => parseInteger(r, 1, MAX_VALUE));

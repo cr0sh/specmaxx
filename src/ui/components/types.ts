@@ -12,6 +12,8 @@ export interface PanelProps {
    * named in the per-pool panels' titles. Absent while off.
    */
   pool?: PoolId;
+  /** Other pool's DP before `poolView` replaces the root degrees; shared lookup controls apply to either pool. */
+  otherPoolDp?: number;
 }
 
 /** The title of a per-pool panel: `Hardware`, or `Hardware (decode pool)` while it edits a pool. */

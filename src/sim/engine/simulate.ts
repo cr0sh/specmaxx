@@ -78,6 +78,8 @@ import {
   expertTpCollectivePath,
   groupSpan,
   hasInterNodeTraffic,
+  lookupTableCollectivePaths,
+  lookupTablesUsePeerReads,
   ppSendPath,
 } from './placement';
 import { resolveSpeculative } from './specdec';
@@ -95,6 +97,7 @@ import type {
 } from './types';
 import { DEFAULT_DISPATCH_SEC_PER_KERNEL, stageKernelCount, withDispatch } from './dispatch';
 import { validateInput } from './validate';
+import { lookupTableConfig } from './offloadRules';
 
 /**
  * The defaults of {@link SimOptions}: no elementwise fusion, ideal comm/compute overlap, best all-reduce, in-network
@@ -307,6 +310,15 @@ function simulatePhase(
         ),
       }
     : {};
+  const lookupPaths =
+    lookupTableConfig(input.deployment?.offload).acrossDp === true && input.parallel.dp > 1
+      ? lookupTableCollectivePaths(
+          input.parallel,
+          topology,
+          base.interStaging,
+          options.inNetworkReduction,
+        )
+      : {};
   const stages = lowered.stages.map((stage) => {
     const ppPath: CollectivePath =
       stage.sendToNext === undefined
@@ -315,7 +327,14 @@ function simulatePhase(
     const ctx: OpTimeContext = {
       engine: base.engine,
       memBandwidthBytesPerSec: base.memBandwidthBytesPerSec,
-      collectivePaths: { tp: base.tpPath, ep: base.epPath, pp: ppPath, ...etpPath, ...dcpPath },
+      collectivePaths: {
+        tp: base.tpPath,
+        ep: base.epPath,
+        pp: ppPath,
+        ...etpPath,
+        ...dcpPath,
+        ...lookupPaths,
+      },
       collectiveAlgorithm: base.collectiveAlgorithm,
       elementwiseFusion: base.elementwiseFusion,
       warnings: base.warnings,
@@ -554,6 +573,8 @@ export function simulate(input: SimInput, run: SimulateRunOptions = {}): SimResu
   if (errors.length > 0) throw new Error(errors.join('\n'));
   const options: SimOptions = { ...DEFAULT_SIM_OPTIONS, ...input.options };
   const { parallel, workload, model, quant } = input;
+  const sharedLookupTables =
+    lookupTableConfig(input.deployment?.offload).acrossDp === true && parallel.dp > 1;
 
   // 2. Modifiers, engine, memory bandwidth, collective paths.
   const hw = effectiveHardware(input.hardware);
@@ -571,7 +592,10 @@ export function simulate(input: SimInput, run: SimulateRunOptions = {}): SimResu
   // over the inter-node link stages every inter-node message through host memory. Absent ⇒ the paths of before.
   const hostStaging = resolveHostStaging(device, hw.topology, input.hardware, parallel);
   const interStaging = hostStaging.staging;
-  if (interStaging !== undefined && hasInterNodeTraffic(parallel, hw.topology)) {
+  if (
+    interStaging !== undefined &&
+    hasInterNodeTraffic(parallel, hw.topology, sharedLookupTables)
+  ) {
     warnings.push(...hostStaging.warnings);
   }
   const algorithm: AllReduceAlgorithm = options.collectiveAlgorithm;
@@ -664,6 +688,20 @@ export function simulate(input: SimInput, run: SimulateRunOptions = {}): SimResu
     parallel,
   };
   if (resolved.offload !== undefined) prefillCtx.offload = resolved.offload;
+  if (sharedLookupTables) {
+    const peerReads = lookupTablesUsePeerReads(parallel, hw.topology);
+    prefillCtx.lookupTables = { peerReads };
+    if (
+      peerReads &&
+      model.layers.some((l) =>
+        l.blocks.some((b) => b.kind === 'ngram_embedding' && b.headRows !== undefined),
+      )
+    ) {
+      warnings.push(
+        'lookup tables: peer-HBM traffic is a bandwidth ceiling; remote-load latency, transaction headers and routing skew are not modeled',
+      );
+    }
+  }
   // Decode @ N: N tokens are already in the KV cache and one new token is generated, so the new token's query
   // sees its own key too.  Formula: qLen = 1; kvLen = past + qLen = N + 1  (docs §7 "Pipeline and DP").
   const decodePastTokens = workload.decodeContextLen;

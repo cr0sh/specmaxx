@@ -18,7 +18,7 @@ import type { OverlapClass, SimOptions } from './types';
  * stage that leaves the stage and lies on the latency path instead). Dimensionless.
  */
 export interface OverlapFractions {
-  /** f_tp: tensor/context-parallel collectives (groups `tp`, `etp`, `dcp`). Dimensionless, in [0, 1]. */
+  /** f_tp: tensor/context/lookup collectives (groups `tp`, `etp`, `dcp`, `dp`, `tp_dp`). Dimensionless, in [0, 1]. */
   tp: number;
   /** f_ep: EP-group collectives (MoE dispatch/combine all-to-alls, DP-attention gathers). Dimensionless, in [0, 1]. */
   ep: number;
@@ -33,7 +33,8 @@ export const IDEAL_OVERLAP: Readonly<OverlapFractions> = Object.freeze({ tp: 1, 
 export const NO_OVERLAP: Readonly<OverlapFractions> = Object.freeze({ tp: 0, ep: 0, pp: 0 });
 
 /**
- * The overlap class of a collective inside a stage's layers, by its parallel group: `tp`, `etp`, `dcp` → `'tp'`;
+ * The overlap class of a collective inside a stage's layers, by its parallel group: `tp`, `etp`, `dcp`, `dp`,
+ * `tp_dp` → `'tp'` (shared lookup exchanges follow the existing lookup TP all-reduce);
  * `ep` → `'ep'`. A `pp`-group collective belongs to the stage boundary (`sendToNext` / `sendToFirst`), never inside
  * a stage's layers, so it throws here (an invariant violation of lowering).
  */
@@ -42,6 +43,8 @@ export function overlapClassOf(group: CollectiveOp['group']): Exclude<OverlapCla
     case 'tp':
     case 'etp':
     case 'dcp':
+    case 'dp':
+    case 'tp_dp':
       return 'tp';
     case 'ep':
       return 'ep';

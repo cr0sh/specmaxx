@@ -274,8 +274,14 @@ export function App({
             loaded,
             built: pdBuilt.decode,
             pool: 'decode',
+            otherPoolDp: state.parallel.dp,
           }
-        : { ...props, built: pdBuilt.prefill, pool: 'prefill' };
+        : {
+            ...props,
+            built: pdBuilt.prefill,
+            pool: 'prefill',
+            otherPoolDp: state.disaggregation?.decodePool.parallel.dp,
+          };
   // The memory card's one-click fixes of each pool that does not fit (computed with the sim, so only when needed).
   // They run the same actions as the manual controls; the decode pool's through `inPool`.
   const memoryFixes = useMemo(

@@ -45,6 +45,33 @@ test('MTP speculative decoding shows the speedup on the decode rate and survives
   expect(errors).toEqual([]);
 });
 
+test('DP2 lookup sharing halves the device table memory and survives a reload', async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await mockHf(page);
+  await page.goto('/?m=Qwen/Qwen3.8-Flash-Next&n=2&dp=2&b=2');
+  const table = page.getByTestId('memory-legend').locator('li').filter({ hasText: 'n-gram table' });
+  // Fixture: 102,400,000,000 bytes, displayed with three significant digits; DP2 owns half.
+  await expect(table).toHaveText('n-gram table 102GB');
+  await hardwareAdvanced(page).locator(':scope > summary').click();
+  await pick(page, 'Share lookup tables across DP', 'on');
+  await expect(page).toHaveURL(/ltdp=1/);
+  await expect(table).toHaveText('n-gram table 51.2GB');
+  await expect(page.getByTestId('memory-tier')).toHaveCount(0);
+  await page.reload();
+  await expect(table).toHaveText('n-gram table 51.2GB');
+  await hardwareAdvanced(page).locator(':scope > summary').click();
+  await expect(page.getByRole('combobox', { name: 'Share lookup tables across DP' })).toHaveText(
+    'on',
+  );
+  await pick(page, 'Share lookup tables across DP', 'off');
+  await expect(page).not.toHaveURL(/ltdp=/);
+  await expect(table).toHaveText('n-gram table 102GB');
+  expect(errors).toEqual([]);
+});
+
 test('DSpark without a released drafter uses the hypothetical one, badged', async ({ page }) => {
   await mockHf(page);
   await page.goto('/');

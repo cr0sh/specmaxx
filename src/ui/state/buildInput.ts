@@ -5,6 +5,7 @@
 
 import type { SimInput } from '../../sim/engine/types';
 import { validateInput } from '../../sim/engine/validate';
+import { hasOffDevicePlacement } from '../../sim/engine/offloadRules';
 import type { ModelSpec } from '../../sim/ir/model';
 import { REF_DENSE_8B } from '../../sim/models/reference';
 import type { HfMapResult, QuantDefaults } from '../../sim/models/hf/types';
@@ -15,7 +16,7 @@ import { resolveHardware, type ResolvedHardware } from './hardware';
 import { effectiveParallel, fieldIssues, hasErrors, type FieldIssue } from './parallelism';
 import { REFERENCE_QUANT_DEFAULTS, applyQuantOverride } from './quant';
 import { deploymentConfig, type DrafterStatus } from './deploymentInput';
-import { effectiveOptions, twoBatchOverlapApplies } from './overlap';
+import { effectiveOptions, hasLookupCollectives, twoBatchOverlapApplies } from './overlap';
 
 /**
  * The panel an engine validation message belongs to, by its wording (speculative decoding, two-batch overlap,
@@ -123,9 +124,13 @@ export function buildSimInput(
     };
   }
   const deployment = deploymentConfig(state, loaded.model, drafter);
+  const offloads = hasOffDevicePlacement(
+    deployment.config?.offload,
+    state.workload.prefixCacheHitRatio,
+  );
   let hardware: ResolvedHardware;
   try {
-    hardware = resolveHardware(state.hw, deployment.config?.offload !== undefined);
+    hardware = resolveHardware(state.hw, offloads);
   } catch (e) {
     return {
       kind: 'issues',
@@ -146,7 +151,6 @@ export function buildSimInput(
     ...deployment.issues,
   ];
   // Two-batch overlap only where it applies (MoE mode B, nothing offloaded); with offload it is not modelled.
-  const offloads = deployment.config?.offload !== undefined;
   const twoBatchOverlap =
     state.deployment.twoBatchOverlap === true &&
     twoBatchOverlapApplies(loaded.model, parallel, offloads);
@@ -164,7 +168,13 @@ export function buildSimInput(
     ? { ...deployment.config, twoBatchOverlap: true }
     : deployment.config;
   // Per-class overlap only for the classes the run has: a stale choice (a hidden row) changes nothing.
-  const options = effectiveOptions(state.options, loaded.model, parallel);
+  const lookupCollectives = hasLookupCollectives(
+    loaded.model,
+    parallel,
+    state.deployment.offload,
+    hardware.topology,
+  );
+  const options = effectiveOptions(state.options, loaded.model, parallel, lookupCollectives);
   if (hasErrors(issues)) return { kind: 'issues', issues, hardware };
   const input: SimInput = {
     model: loaded.model,

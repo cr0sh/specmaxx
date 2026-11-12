@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { expertRules, lookupTableRules } from './offloadRules';
+import { expertRules, hasOffDevicePlacement, lookupTableRules } from './offloadRules';
 import type { LookupTableRule, RoutedExpertRule } from './types';
 
 const ram: RoutedExpertRule = {
@@ -27,6 +27,34 @@ describe('expertRules', () => {
   });
   it('[] → []', () => {
     expect(expertRules({ routedExperts: [] })).toEqual([]);
+  });
+});
+
+describe('hasOffDevicePlacement', () => {
+  const shared = { lookupTables: { acrossDp: true } } as const;
+
+  it('sharing alone needs no host, while independent weight placements still do', () => {
+    expect(hasOffDevicePlacement(undefined)).toBe(false);
+    expect(hasOffDevicePlacement(shared)).toBe(false);
+    expect(hasOffDevicePlacement({ ...shared, routedExperts: ram })).toBe(true);
+    expect(hasOffDevicePlacement({ ...shared, embeddings: { tier: 'host_ram' } })).toBe(true);
+    expect(hasOffDevicePlacement({ lookupTables: { placements: { tier: 'device' } } })).toBe(false);
+  });
+
+  it('counts live KV in RAM, SSD or a remote pool even with shared device tables', () => {
+    for (const kvCache of [
+      { deviceFraction: 0.5 },
+      { deviceFraction: 0.5, hostRamFraction: 0 },
+      { deviceFraction: 0.5, hostRamFraction: 0, remotePool: { fraction: 0.5 } },
+    ])
+      expect(hasOffDevicePlacement({ ...shared, kvCache })).toBe(true);
+    expect(hasOffDevicePlacement({ ...shared, kvCache: { deviceFraction: 1 } })).toBe(false);
+  });
+
+  it('prefix-only KV placement needs a host only when the workload has cached prefix tokens', () => {
+    const config = { ...shared, kvCache: { deviceFraction: 1, prefixDeviceFraction: 0.25 } };
+    expect(hasOffDevicePlacement(config)).toBe(false);
+    expect(hasOffDevicePlacement(config, 0.5)).toBe(true);
   });
 });
 

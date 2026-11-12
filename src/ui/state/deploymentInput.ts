@@ -18,6 +18,7 @@ import type {
   SpecDecodeConfig,
 } from '../../sim/engine/types';
 import { defaultDraftLength, presetAcceptance, type SpecUseCase } from '../../sim/engine/specdec';
+import { hasOffDevicePlacement } from '../../sim/engine/offloadRules';
 import type { BlockDraftSpec, ModelSpec } from '../../sim/ir/model';
 import { modelHasOffloadableKv, modelHasTopKKv } from '../../sim/lower/kvOffload';
 import { hypotheticalDrafter, knownDrafters } from '../../sim/models/hf/drafter';
@@ -323,8 +324,13 @@ export function deploymentConfig(
     }
     if (o.tables !== undefined) {
       if (!hasLookupTables(model))
-        warn('offload', 'The model has no n-gram lookup tables; their placement has no effect.');
-      else {
+        warn(
+          'offload',
+          o.tables.acrossDp === true
+            ? 'The model has no n-gram lookup tables; sharing has no effect.'
+            : 'The model has no n-gram lookup tables; their placement has no effect.',
+        );
+      else if (o.tables.tier !== undefined) {
         const split = o.tables.tier === 'split';
         const chosenLayout = o.tables.scaleLayout;
         /**
@@ -348,8 +354,12 @@ export function deploymentConfig(
           tableLayerIndices(model),
           layerCount,
         );
-        out.lookupTables =
-          ranges.length === 1 ? rule(ranges[0], true) : ranges.map((r) => rule(r, false));
+        out.lookupTables = {
+          placements:
+            ranges.length === 1 ? rule(ranges[0], true) : ranges.map((r) => rule(r, false)),
+        };
+      } else if (o.tables.acrossDp === true) {
+        out.lookupTables = { acrossDp: true };
       }
     }
     // A tied table is also the LM head's matrix (a GEMM every step): it cannot leave the device. A choice carried
@@ -367,17 +377,16 @@ export function deploymentConfig(
         if (kvCache !== undefined) out.kvCache = kvCache;
       }
     }
-    const placed =
-      out.routedExperts !== undefined ||
-      out.lookupTables !== undefined ||
-      out.embeddings !== undefined ||
-      out.kvCache !== undefined;
-    if (placed)
+    const configured = Object.keys(out).length > 0;
+    const offDevice = hasOffDevicePlacement(out, state.workload.prefixCacheHitRatio);
+    if (configured)
       offload = {
         ...out,
-        ...(o.queueDepth !== undefined ? { queueDepth: o.queueDepth } : {}),
-        ...(o.ssdReadRate === 'sustained' ? { ssdReadRate: o.ssdReadRate } : {}),
-        ...(o.prefetchAccuracy !== undefined ? { prefetchAccuracy: o.prefetchAccuracy } : {}),
+        ...(offDevice && o.queueDepth !== undefined ? { queueDepth: o.queueDepth } : {}),
+        ...(offDevice && o.ssdReadRate === 'sustained' ? { ssdReadRate: o.ssdReadRate } : {}),
+        ...(offDevice && o.prefetchAccuracy !== undefined
+          ? { prefetchAccuracy: o.prefetchAccuracy }
+          : {}),
       };
   }
 

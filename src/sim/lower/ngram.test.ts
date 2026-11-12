@@ -4,13 +4,21 @@ import { RTX_5090 } from '../hw/presets/nvidia';
 import { DDR5_6000_2CH, NVME_990_PRO_2TB } from '../hw/presets/storage';
 import type { ModelSpec, QuantConfig } from '../ir/model';
 import type { TransferOp } from '../ir/ops';
-import { stageLookupTableBytes, stageTierBreakdown, stageTierBytes } from '../engine/memory';
+import {
+  stageActivationPeakBytes,
+  stageLookupTableBytes,
+  stageTierBreakdown,
+  stageTierBytes,
+} from '../engine/memory';
+import { opBytes } from '../ir/metrics';
 import { simulate } from '../engine/simulate';
 import { transferTime } from '../engine/transfer';
 import { fixtureRepoFiles } from '../models/__fixtures__/fixtures.testutil';
 import { mapHfModel } from '../models/hf/index';
 import { lowerModel, type LoweringContext, type OffloadLowering } from './lower';
-import { tableRowBytes } from './ngram';
+import { lowerNgram, ngramTableShardBytes, tableRowBytes } from './ngram';
+import { draftResidentWeightBytes, lowerDraftDecode } from './draft';
+import { REF_DENSE_8B_MTP } from '../models/referenceDraft';
 
 function hf(repo: string): { model: ModelSpec; quant: QuantConfig } {
   const mapped = mapHfModel(fixtureRepoFiles(repo, { dir: '' }));
@@ -169,6 +177,100 @@ describe('U-16 n-gram tables off-device: read layouts, tier bytes and PCIe bytes
     expect(b.routedExperts).toBeGreaterThan(0);
     expect(b.draftExperts).toBe(0);
     expect(stageTierBytes(PLE.model, ctx, 0).host_ram).toBe(b.lookupTables + b.routedExperts);
+  });
+
+  describe('device tables shared across DP', () => {
+    it('Engram TP 2 × DP 2 owns complete hash heads, exchanges IDs/rows, and retains local projections', () => {
+      const block = ENGRAM.model.layers[1].blocks.find((b) => b.kind === 'ngram_embedding')!;
+      const ctx: LoweringContext = {
+        ...decodeCtx(ENGRAM.quant),
+        seqs: 3,
+        parallel: { tp: 2, pp: 1, dp: 2, ep: 1 },
+        lookupTables: { peerReads: false },
+      };
+      const ops = lowerNgram(block, ctx);
+      // Six consecutive prime-sized head buckets, not ceil(totalRows / 4). MXFP8 rows include 8 scale bytes.
+      expect(ngramTableShardBytes(block, ctx)).toBe(96_002_514 * 264);
+      expect(stageLookupTableBytes(ENGRAM.model, ctx, 0)).toBe((96_002_514 + 96_005_118) * 264);
+      expect(ops[0]).toMatchObject({
+        group: 'dp',
+        collective: 'all_gather',
+        messageBytes: 576,
+        dtype: 'int32',
+      });
+      expect(ops[1]).toMatchObject({ kind: 'embedding', tokens: 36, vocabShard: 96_002_514 });
+      expect(ops[2]).toMatchObject({
+        group: 'dp',
+        collective: 'all_gather',
+        messageBytes: 36_864,
+        workspaceBytes: 74_304,
+      });
+      expect(ops[3]).toMatchObject({ kind: 'elementwise', fn: 'copy', flopsPerElem: 0 });
+      expect(ops[4]).toMatchObject({ group: 'tp', collective: 'all_gather', messageBytes: 36_864 });
+      const unshared = lowerNgram(block, { ...ctx, lookupTables: undefined });
+      expect(ops.slice(5)).toEqual(unshared.slice(2));
+      const lowered = {
+        stages: [{ index: 0, layers: [{ name: block.name, layerIndex: 1, ops: ops.slice(0, 5) }] }],
+      };
+      expect(stageActivationPeakBytes([lowered], 0)).toBe(74_304);
+    });
+
+    it('verification shares the target tables while drafter lookup ops and resident bytes stay unchanged', () => {
+      const block = ENGRAM.model.layers[1].blocks.find((b) => b.kind === 'ngram_embedding')!;
+      const mtp = REF_DENSE_8B_MTP.draft;
+      if (mtp?.kind !== 'mtp') throw new Error('MTP fixture needs an MTP head');
+      const draft = { ...mtp, layers: [{ name: 'draft.table', blocks: [block] }] };
+      const ctx: LoweringContext = {
+        ...decodeCtx(ENGRAM.quant),
+        qLen: 3,
+        parallel: { tp: 1, dp: 2, pp: 1, ep: 1 },
+        lookupTables: { peerReads: false },
+      };
+      const plain = { ...ctx, lookupTables: undefined };
+      expect(lowerNgram(block, ctx)[0]).toMatchObject({ group: 'dp', messageBytes: 576 });
+      expect(lowerDraftDecode(ENGRAM.model, draft, ctx, 1, 2)).toEqual(
+        lowerDraftDecode(ENGRAM.model, draft, plain, 1, 2),
+      );
+      expect(draftResidentWeightBytes(ENGRAM.model, draft, ctx)).toBe(
+        draftResidentWeightBytes(ENGRAM.model, draft, plain),
+      );
+    });
+
+    it.each(['bf16', 'fp8_e4m3'] as const)(
+      'PLE TP 2 × DP 2: %s activations keep reduction buffers at least 16-bit',
+      (activations) => {
+        const block = PLE.model.layers[1].blocks.find((b) => b.kind === 'ngram_embedding')!;
+        const ctx: LoweringContext = {
+          ...decodeCtx({ ...PLE.quant, activations }),
+          seqs: 3,
+          parallel: { tp: 2, pp: 1, dp: 2, ep: 1 },
+          lookupTables: { peerReads: false },
+        };
+        const ops = lowerNgram(block, ctx);
+        expect(ngramTableShardBytes(block, ctx)).toBe(102_400_000_000 / 4);
+        expect(ops[0]).toMatchObject({
+          group: 'dp',
+          collective: 'all_gather',
+          messageBytes: 768,
+          dtype: 'int64',
+        });
+        expect(ops[1]).toMatchObject({
+          kind: 'embedding',
+          tokens: 96,
+          rowsRead: 24,
+          outputDtype: 'bf16',
+        });
+        expect(opBytes(ops[1])).toMatchObject({ weightBytes: 7_680, activationWriteBytes: 30_720 });
+        expect(ops[2]).toMatchObject({
+          group: 'tp_dp',
+          groupSize: 4,
+          collective: 'all_reduce',
+          dtype: 'bf16',
+          messageBytes: 30_720,
+          workspaceBytes: 62_208,
+        });
+      },
+    );
   });
 
   describe('quant.lookupTables (the lookup-table format picker)', () => {

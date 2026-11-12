@@ -3,6 +3,9 @@ import { SYNTH_CLUSTER, SYNTH_IB, SYNTH_NVLINK } from '../__fixtures__/synthetic
 import {
   checkPlacement,
   collectivePath,
+  lookupTableCollectivePaths,
+  lookupTablesUsePeerReads,
+  hasInterNodeTraffic,
   expertTpCollectivePath,
   expertTpGroupSpan,
   groupSpan,
@@ -11,6 +14,19 @@ import {
   ppSendPath,
 } from './placement';
 import type { TopologySpec } from '../hw/types';
+import {
+  RTX_3090_NVLINK,
+  A100_NVLINK_BRIDGE,
+  NVLINK_2_PAIR,
+  NVLINK_2_MESH_4,
+  NVLINK_2_HCM_8,
+  NVLINK_3,
+  NVLINK_4,
+  NVLINK_5,
+  NVLINK_5_NVL72,
+  NVLINK_5_NVL4,
+  NVLINK_C2C,
+} from '../hw/presets/links';
 
 // SYNTH_CLUSTER: 8 devices per node × 2 nodes, NVLink intra, InfiniBand inter.
 describe('placement on SYNTH_CLUSTER (T8)', () => {
@@ -28,6 +44,112 @@ describe('placement on SYNTH_CLUSTER (T8)', () => {
     const span = groupSpan(16, SYNTH_CLUSTER);
     expect(span).toEqual({ n: 16, devicesPerNodeInGroup: 8, nodesSpanned: 2 }); // 16 % 8 == 0
     expect(collectivePath(span, SYNTH_CLUSTER).kind).toBe('hierarchical');
+  });
+
+  it.each([
+    RTX_3090_NVLINK,
+    A100_NVLINK_BRIDGE,
+    NVLINK_2_PAIR,
+    NVLINK_2_MESH_4,
+    NVLINK_3,
+    NVLINK_4,
+    NVLINK_5,
+    NVLINK_5_NVL72,
+  ])('peer access requires a supported complete domain: $name', (link) => {
+    const n = link.fullyConnectedDevices!;
+    const topo = { ...SYNTH_CLUSTER, nodes: 1, devicesPerNode: n, intraNode: link };
+    const par = { tp: 1, dp: n, pp: 1, ep: 1 };
+    expect(lookupTablesUsePeerReads(par, topo)).toBe(true);
+    expect(lookupTablesUsePeerReads({ ...par, dp: 1 }, topo)).toBe(false);
+    expect(lookupTablesUsePeerReads({ ...par, tp: 2 }, topo)).toBe(false);
+    expect(lookupTablesUsePeerReads({ ...par, pp: 2 }, topo)).toBe(false);
+    // A small DP group does not prove its ranks are connected inside a domain larger than this profile.
+    expect(lookupTablesUsePeerReads({ ...par, dp: 2 }, { ...topo, devicesPerNode: n + 1 })).toBe(
+      false,
+    );
+    expect(
+      lookupTablesUsePeerReads(par, {
+        ...topo,
+        intraNode: { ...link, fullyConnectedDevices: undefined },
+      }),
+    ).toBe(false);
+  });
+
+  it('partial, inferred and CPU–GPU links do not acquire full peer connectivity from their names or NVLS', () => {
+    for (const link of [NVLINK_2_HCM_8, NVLINK_5_NVL4, NVLINK_C2C]) {
+      expect(link.fullyConnectedDevices).toBeUndefined();
+      expect(
+        lookupTablesUsePeerReads(
+          { tp: 1, dp: 2, pp: 1, ep: 1 },
+          { ...SYNTH_CLUSTER, nodes: 1, intraNode: { ...link, inNetworkReduction: 'nvls' } },
+        ),
+      ).toBe(false);
+    }
+  });
+
+  it('a partial NVL72 domain can use peer reads with PP2, without tiling the unused devices', () => {
+    expect(
+      lookupTablesUsePeerReads(
+        { tp: 1, dp: 32, pp: 2, ep: 1 },
+        { ...SYNTH_CLUSTER, nodes: 1, devicesPerNode: 72, intraNode: NVLINK_5_NVL72 },
+      ),
+    ).toBe(true);
+  });
+
+  it('DP groups are strided by TP, not contiguous groups of dp devices', () => {
+    expect(lookupTableCollectivePaths({ tp: 8, dp: 2, pp: 1, ep: 1 }, SYNTH_CLUSTER).dp).toEqual({
+      kind: 'flat',
+      level: 'inter',
+      link: SYNTH_IB,
+    });
+    expect(
+      lookupTableCollectivePaths({ tp: 4, dp: 4, pp: 1, ep: 1 }, SYNTH_CLUSTER).dp,
+    ).toMatchObject({ kind: 'hierarchical', devicesPerNode: 2, nodes: 2 });
+    const par = { tp: 1, dp: 2, pp: 1, ep: 1 };
+    const topo = { ...SYNTH_CLUSTER, devicesPerNode: 1 };
+    expect(hasInterNodeTraffic(par, topo)).toBe(false);
+    expect(hasInterNodeTraffic(par, topo, true)).toBe(true);
+    expect(() =>
+      lookupTableCollectivePaths(
+        { tp: 16, dp: 2, pp: 1, ep: 1 },
+        {
+          ...SYNTH_CLUSTER,
+          nodes: 4,
+          interNodeFabric: { kind: 'ring' },
+        },
+      ),
+    ).toThrow(/DP group.*2 apart/);
+  });
+
+  it.each([1, 2])('lookup groups can occupy only part of one 72-device domain at PP %i', (pp) => {
+    const topo = { ...SYNTH_CLUSTER, devicesPerNode: 72, nodes: 1 };
+    const par = { tp: 1, dp: 32, pp, ep: 1 };
+    const path = { kind: 'flat', level: 'intra', link: SYNTH_NVLINK };
+    expect(lookupTableCollectivePaths(par, topo)).toEqual({ dp: path, tp_dp: path });
+    expect(hasInterNodeTraffic(par, topo, true)).toBe(false);
+    // This exception belongs to the wholly intra-node lookup run, not arbitrary tiled groups.
+    expect(() => groupSpan(32, topo)).toThrow(/does not tile/);
+  });
+
+  it('lookup paths inherit multi-NIC sharing and the in-network reduction switch', () => {
+    const topo: TopologySpec = {
+      ...SYNTH_CLUSTER,
+      nicsPerNode: 2,
+      intraNode: { ...SYNTH_NVLINK, inNetworkReduction: 'nvls' },
+      interNode: { ...SYNTH_IB, inNetworkReduction: 'sharp' },
+    };
+    const par = { tp: 2, dp: 8, pp: 1, ep: 1 };
+    const paths = lookupTableCollectivePaths(par, topo, undefined, 'on');
+    for (const path of Object.values(paths))
+      expect(path).toMatchObject({
+        kind: 'hierarchical',
+        intraInNetworkReduction: 'nvls',
+        interInNetworkReduction: 'sharp',
+        inter: { bandwidthPerDirectionBytesPerSec: SYNTH_IB.bandwidthPerDirectionBytesPerSec / 4 },
+      });
+    expect(lookupTableCollectivePaths(par, topo).tp_dp).not.toHaveProperty(
+      'intraInNetworkReduction',
+    );
   });
 
   it('tp 3 is an error (3 ∤ 8 and 8 ∤ 3)', () => {

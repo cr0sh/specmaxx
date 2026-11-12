@@ -369,7 +369,7 @@ export function validateHost(h: HostSpec, label = 'host'): string[] {
  * `hostBounce` present iff `p2p === 'host_bounce'`, with host memory bandwidth > 0; an
  * `allPortsCapPerDirectionBytesPerSec` at least the per-port bandwidth; `transport: 'tcp'` only with
  * `gpuDirectRdma: false` (a socket takes host pointers only); `inNetworkReduction`, when present, one of `'nvls'`,
- * `'sharp'`.
+ * `'sharp'`; `fullyConnectedDevices`, when present, a safe integer ≥ 2 (sourced domain size, not a neighbour count).
  */
 export function validateLink(l: LinkSpec, label = `link ${l.name}`): string[] {
   const errors = [
@@ -383,6 +383,12 @@ export function validateLink(l: LinkSpec, label = `link ${l.name}`): string[] {
   }
   if (l.hostBounce !== undefined && !(l.hostBounce.hostMemBandwidthBytesPerSec > 0)) {
     errors.push(`${label}: hostBounce.hostMemBandwidthBytesPerSec must be > 0`);
+  }
+  if (
+    l.fullyConnectedDevices !== undefined &&
+    (!Number.isSafeInteger(l.fullyConnectedDevices) || l.fullyConnectedDevices < 2)
+  ) {
+    errors.push(`${label}: fullyConnectedDevices must be a safe integer ≥ 2`);
   }
   const cap = l.allPortsCapPerDirectionBytesPerSec;
   if (cap !== undefined && !(cap >= l.bandwidthPerDirectionBytesPerSec)) {

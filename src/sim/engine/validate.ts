@@ -17,7 +17,7 @@ import {
   validateLinkModifiers,
   validateTopology,
 } from '../hw/validate';
-import { applyDeviceModifiers } from '../hw/modifiers';
+import { applyDeviceModifiers, applyLinkModifiers } from '../hw/modifiers';
 import { deviceHostLink } from '../hw/presets/links';
 import { A2A_FORMATS, isA2aFormat } from '../ir/a2aFormat';
 import type { ModelSpec } from '../ir/model';
@@ -31,8 +31,18 @@ import {
 } from '../lower/dcp';
 import { modelHasOffloadableKv } from '../lower/kvOffload';
 import { moeParallelErrors } from '../lower/moe';
-import { checkPlacement, expertTpCollectivePath } from './placement';
-import { expertRules, lookupTableRules } from './offloadRules';
+import {
+  checkPlacement,
+  expertTpCollectivePath,
+  lookupTableCollectivePaths,
+  lookupTablesUsePeerReads,
+} from './placement';
+import {
+  expertRules,
+  kvCacheMovesAnything,
+  lookupTableConfig,
+  lookupTableRules,
+} from './offloadRules';
 import type { KvCacheOffloadConfig, LayerRange, SimInput } from './types';
 
 /**
@@ -333,6 +343,48 @@ export function validateInput(input: SimInput): string[] {
       errors.push(`etp: ${(e as Error).message}`);
     }
   }
+  if (
+    lookupTableConfig(input.deployment?.offload).acrossDp === true &&
+    parallel.dp > 1 &&
+    errors.length === 0
+  ) {
+    const label = 'deployment.offload.lookupTables.acrossDp';
+    try {
+      // Use the same modified links as simulation; changing P2P can change the table ownership layout.
+      const effectiveTopology = { ...topology };
+      for (const level of ['intraNode', 'interNode'] as const) {
+        const link = topology[level];
+        const mods = hardware.linkModifiers?.[level] ?? [];
+        if (link !== undefined && mods.length > 0)
+          effectiveTopology[level] = applyLinkModifiers(link, mods);
+      }
+      lookupTableCollectivePaths(parallel, effectiveTopology);
+      const peer = lookupTablesUsePeerReads(parallel, effectiveTopology);
+      const hasHeadTables = model.layers.some((l) =>
+        l.blocks.some((b) => b.kind === 'ngram_embedding' && b.headRows !== undefined),
+      );
+      if (hasHeadTables && parallel.tp * parallel.pp * parallel.dp > topology.devicesPerNode) {
+        errors.push(
+          `${label}: Engram currently requires all replicas in one node; node-local DP subgroups and cross-node peer-HBM domains are not modeled`,
+        );
+      }
+      if (!peer) {
+        const shards = parallel.tp * parallel.dp;
+        for (const layer of model.layers)
+          for (const block of layer.blocks) {
+            if (block.kind !== 'ngram_embedding' || block.headRows === undefined) continue;
+            const heads = block.rowsPerToken;
+            if ((shards - 1) * Math.ceil(heads / shards) >= heads) {
+              errors.push(
+                `${label}: ${layer.name} would leave a rank without hash heads (${heads} heads over ${shards} shards)`,
+              );
+            }
+          }
+      }
+    } catch (e) {
+      errors.push(`${label}: ${(e as Error).message}`);
+    }
+  }
   return errors;
 }
 
@@ -384,19 +436,6 @@ function inRange(x: number, lo: number, hi: number, hiOpen = false): boolean {
  */
 export const KV_CACHE_NO_OFFLOADABLE_ERROR =
   'deployment.offload.kvCache: the model has no offloadable KV cache (only sliding-window, recurrent or CSA state)';
-
-/**
- * True if a KV-cache placement moves anything off the device before the unified-memory fold-in: `f_dev < 1`, or a
- * prefix share `f_pre < 1` with a prefix-cache hit (`prefixCacheHitRatio > 0`).
- */
-function kvCacheMovesAnything(
-  kv: KvCacheOffloadConfig | undefined,
-  prefixCacheHitRatio: number | undefined,
-): boolean {
-  if (kv === undefined) return false;
-  const fPre = kv.prefixDeviceFraction ?? kv.deviceFraction;
-  return kv.deviceFraction < 1 || ((prefixCacheHitRatio ?? 0) > 0 && fPre < 1);
-}
 
 /**
  * Errors of `deployment.offload.kvCache` (docs/simulation-model.md §12 "KV cache off-device"): `deviceFraction`,
@@ -576,11 +615,41 @@ export function deploymentErrors(input: SimInput): string[] {
       );
     }
     const tables = lookupTableRules(offload);
+    const tableConfig = lookupTableConfig(offload);
+    if (tableConfig.acrossDp !== undefined && typeof tableConfig.acrossDp !== 'boolean') {
+      errors.push('deployment.offload.lookupTables.acrossDp must be a boolean');
+    }
+    if (tableConfig.acrossDp === true) {
+      if (!model.layers.some((l) => l.blocks.some((b) => b.kind === 'ngram_embedding'))) {
+        errors.push(
+          'deployment.offload.lookupTables.acrossDp: the model has no n-gram lookup table',
+        );
+      }
+      if (tables.some((rule) => rule.tier !== 'device')) {
+        errors.push(
+          'deployment.offload.lookupTables.acrossDp requires every lookup-table placement to be device',
+        );
+      }
+    }
+    // Preserve legacy error paths; the wrapper names its placements explicitly.
+    const wrapped =
+      offload.lookupTables !== undefined &&
+      !Array.isArray(offload.lookupTables) &&
+      !('tier' in offload.lookupTables);
+    if (wrapped) {
+      for (const key of Object.keys(tableConfig)) {
+        if (key !== 'acrossDp' && key !== 'placements')
+          errors.push(
+            `deployment.offload.lookupTables.${key}: unknown key (expected acrossDp or placements)`,
+          );
+      }
+    }
+    const tablePrefix = wrapped
+      ? 'deployment.offload.lookupTables.placements'
+      : 'deployment.offload.lookupTables';
     // The object form keeps its original message paths; a list names the rule: `lookupTables[i].…`.
     const tableLabel = (i: number): string =>
-      Array.isArray(offload.lookupTables)
-        ? `deployment.offload.lookupTables[${i}]`
-        : 'deployment.offload.lookupTables';
+      Array.isArray(tableConfig.placements) ? `${tablePrefix}[${i}]` : tablePrefix;
     const offDeviceTables = tables.some((rule) => rule.tier !== 'device');
     if (offDeviceTables) {
       const hasNgram = model.layers.some((l) => l.blocks.some((b) => b.kind === 'ngram_embedding'));
@@ -598,7 +667,7 @@ export function deploymentErrors(input: SimInput): string[] {
         errors.push(`${label}.layers is required when there is more than one rule`);
       }
     });
-    errors.push(...overlapErrors(tables, 'deployment.offload.lookupTables'));
+    errors.push(...overlapErrors(tables, tablePrefix));
     // Token embedding (docs/simulation-model.md §12 "Token embedding off-device"): a tied table is also the LM head's
     // GEMM weight, read whole every step, so it must stay on the device; a duplicate copy is not modelled.
     const embeddingTier: unknown = offload.embeddings?.tier;

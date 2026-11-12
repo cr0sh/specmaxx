@@ -170,6 +170,7 @@ export interface DeepseekConfig {
   sinkhornIters: number;
   engramLayers: number[];
   engramRows: number[];
+  engramHeadRows: number[][];
   engramRowDim: number;
   engramRowsPerToken: number;
 }
@@ -249,6 +250,7 @@ function deepseekLayer(
           ngram: {
             name: 'engram',
             tableRows: c.engramRows[engramIndex],
+            headRows: c.engramHeadRows[engramIndex],
             rowDim: c.engramRowDim,
             rowsPerToken: c.engramRowsPerToken,
             // Formula: wkv: rowsPerToken·rowDim → (N + 1)·D (one key per stream + a shared value)
@@ -271,6 +273,34 @@ function deepseekLayer(
   });
 }
 
+/**
+ * Contiguous Engram hash-head buckets: successive distinct primes ≥ engram_vocab_size, never reused across
+ * layers. vLLM EngramLayout (7c9a2fa2, common/engram.py); the checkpoint's tableRows remains authoritative.
+ * Undefined when counts or buckets exceed safe integers; the reader reports an invalid config, never a stuck search.
+ */
+function engramHeadRows(base: number, heads: number, layers: number): number[][] | undefined {
+  if (!Number.isSafeInteger(base) || !Number.isSafeInteger(heads) || heads < 0) return undefined;
+  const prime = (n: number): boolean => {
+    if (n < 2) return false;
+    if (n % 2 === 0) return n === 2;
+    for (let d = 3; d * d <= n; d += 2) if (n % d === 0) return false;
+    return true;
+  };
+  let next = base;
+  const buckets: number[][] = [];
+  for (let layer = 0; layer < layers; layer++) {
+    const rows: number[] = [];
+    for (let head = 0; head < heads; head++) {
+      // Above MAX_SAFE_INTEGER, next++ may stop advancing. Reject before searching or emitting such a bucket.
+      while (Number.isSafeInteger(next) && !prime(next)) next++;
+      if (!Number.isSafeInteger(next)) return undefined;
+      rows.push(next++);
+    }
+    buckets.push(rows);
+  }
+  return buckets;
+}
+
 /** Read the config fields the layers need; `n` = `num_hidden_layers` (for the V4 list defaults). */
 function readDeepseekConfig(r: ConfigReader, n: number): DeepseekConfig {
   const hidden = r.int('hidden_size');
@@ -287,6 +317,17 @@ function readDeepseekConfig(r: ConfigReader, n: number): DeepseekConfig {
   const candidateBlocks = r.optInt('candidate_topk_blocks');
   const candidateBlockSize = r.optInt('candidate_block_size');
   const engramLayers = r.optNumArray('engram_layer_ids') ?? [];
+  // Formula: rowsPerToken = (engram_max_ngram_size − 1) · engram_n_heads
+  const engramRowsPerToken =
+    engramLayers.length > 0 ? (r.int('engram_max_ngram_size') - 1) * r.int('engram_n_heads') : 0;
+  const headRows =
+    engramLayers.length > 0
+      ? engramHeadRows(r.int('engram_vocab_size'), engramRowsPerToken, engramLayers.length)
+      : [];
+  if (headRows === undefined)
+    r.errors.push(
+      `${r.path ? `${r.path}.` : ''}engram_vocab_size: cannot generate safe integer hash-head buckets`,
+    );
   const ratios = r.numArray('compress_ratios');
   const mainLayers = ratios.slice(0, n).map((ratio, i) => ({ ratio, i }));
   const indexList = r.optNumArray('index_source_layer_ids');
@@ -315,10 +356,9 @@ function readDeepseekConfig(r: ConfigReader, n: number): DeepseekConfig {
     sinkhornIters: r.optInt('hc_sinkhorn_iters') ?? 0,
     engramLayers,
     engramRows: engramLayers.length > 0 ? r.numArray('engram_num_embeddings') : [],
+    engramHeadRows: headRows ?? [],
     engramRowDim: engramLayers.length > 0 ? r.int('engram_head_dim') : 0,
-    // Formula: rowsPerToken = (engram_max_ngram_size − 1) · engram_n_heads
-    engramRowsPerToken:
-      engramLayers.length > 0 ? (r.int('engram_max_ngram_size') - 1) * r.int('engram_n_heads') : 0,
+    engramRowsPerToken,
   };
 }
 

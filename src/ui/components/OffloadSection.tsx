@@ -689,6 +689,7 @@ function KvCacheFields(props: PanelProps) {
  * tables, the queue depth and the prefetch accuracy (with any offload on).
  */
 export function OffloadAdvancedFields(props: PanelProps) {
+  const { state } = props;
   const controls = offloadControls(props);
   if (controls === undefined) return null;
   const {
@@ -748,7 +749,9 @@ export function OffloadAdvancedFields(props: PanelProps) {
                 ...offload,
                 tables:
                   t === undefined
-                    ? undefined
+                    ? tables?.acrossDp === true
+                      ? { acrossDp: true }
+                      : undefined
                     : t === 'split'
                       ? {
                           tier: t,
@@ -766,7 +769,7 @@ export function OffloadAdvancedFields(props: PanelProps) {
                 : 'Only a few rows are read per token, so an SSD delay matters.',
             ])}
           />
-          {designOffDevice && tables === undefined && (
+          {designOffDevice && tables?.tier === undefined && (
             <button
               type="button"
               className="chip"
@@ -778,6 +781,25 @@ export function OffloadAdvancedFields(props: PanelProps) {
           )}
         </div>
       )}
+      {hasLookupTables(model) && (state.parallel.dp > 1 || (props.otherPoolDp ?? 1) > 1) && (
+        <Picker
+          label="Share lookup tables across DP"
+          value={tables?.tier === undefined && tables?.acrossDp === true ? 'on' : 'off'}
+          options={[
+            { value: 'off', label: 'off' },
+            { value: 'on', label: 'on' },
+          ]}
+          disabled={tables?.tier !== undefined}
+          onChange={(v) => setOffload({ ...offload, tables: { ...tables, acrossDp: v === 'on' } })}
+          help={helpLines([
+            props.pool === undefined
+              ? 'Shares the tables between DP replicas instead of storing one copy per replica.'
+              : 'Shares tables separately in each pool with DP above 1.',
+            'Saves device memory but adds lookup traffic between devices.',
+            'Set Lookup tables to Device to enable sharing.',
+          ])}
+        />
+      )}
       {tables?.tier === 'split' && (
         <SplitFields
           split={tables.split}
@@ -785,7 +807,7 @@ export function OffloadAdvancedFields(props: PanelProps) {
           onChange={(split) => setOffload({ ...offload, tables: { ...tables, split } })}
         />
       )}
-      {tables !== undefined && (
+      {tables?.tier !== undefined && (
         <Picker
           label="Scale layout"
           value={

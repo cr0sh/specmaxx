@@ -163,6 +163,22 @@ describe('deepseek_v41: DeepSeek-V4.1-Flash', () => {
     expect(countParams(other.model)).toBe(countParams(m));
   });
 
+  it.each([Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 1, 1e100])(
+    'rejects unsafe Engram bucket sizes without stalling the loader: %s',
+    (base) => {
+      const files = fixtureRepoFiles(ID);
+      const u = unwrapTextConfig(files.config);
+      if (u.kind !== 'ok') throw new Error('unwrap failed');
+      const text = { ...u.view.text, engram_vocab_size: base };
+      const r = deepseekV41Family.build(text, { ...u.view.top, text_config: text }, files);
+      expect(r.kind).toBe('invalid_config');
+      if (r.kind === 'invalid_config')
+        expect(r.errors).toContain(
+          'text_config.engram_vocab_size: cannot generate safe integer hash-head buckets',
+        );
+    },
+  );
+
   it('rejects a consumer layer with no earlier KV source', () => {
     const files = fixtureRepoFiles(ID);
     const u = unwrapTextConfig(files.config);

@@ -623,6 +623,11 @@ export interface NgramEmbeddingBlock {
    * multiple (relative error below 1e-4; exact 320,001,536 rows vs 320,000,000 for Qwen3.8-Flash-Next). Count.
    */
   tableRows: number;
+  /**
+   * Rows in each contiguous hash-head bucket (Engram). Optional physical layout metadata for whole-head
+   * distribution; length = rowsPerToken, sum ≤ tableRows. Absent = row-parallel table (PLE/legacy fixtures).
+   */
+  headRows?: readonly number[];
   /** Elements per table row (Qwen `ple_embed_dim / ((ngram_size−1)·heads_per_ngram)` 160; DeepSeek `engram_head_dim` 256). Unit: elements. */
   rowDim: number;
   /** Rows gathered per token (Qwen `(ngram_size−1)·heads_per_ngram` 16; DeepSeek `(engram_max_ngram_size−1)·engram_n_heads` 24). Count. */

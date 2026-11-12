@@ -683,6 +683,48 @@ describe('estimator inputs', () => {
     },
     HEAVY_APP_TEST_TIMEOUT_MS,
   );
+  it(
+    'DP-only lookup sharing exposes the existing TP overlap setting and persists ovt',
+    async () => {
+      history.replaceState(null, '', '/?m=Qwen/Qwen3.8-Flash-Next&n=2&dp=2&b=2&ltdp=1&ovt=0');
+      mount();
+      await screen.findByTestId('decode-tps');
+      const section = screen.getByTestId('overlap-advanced');
+      const picker = within(section).getByRole('combobox', { name: 'TP / lookup exchange' });
+      expect(picker.textContent).toContain('None');
+      fireEvent.click(picker);
+      fireEvent.click(await screen.findByRole('option', { name: 'Full' }));
+      await waitFor(() => expect(location.search).toContain('ovt=100'));
+      fireEvent.click(screen.getByRole('combobox', { name: 'Share lookup tables across DP' }));
+      fireEvent.click(await screen.findByRole('option', { name: 'off' }));
+      await waitFor(() => expect(screen.queryByTestId('overlap-advanced')).toBeNull());
+      await waitFor(() => expect(location.search).not.toContain('ltdp'));
+      expect(location.search).toContain('ovt=100');
+    },
+    HEAVY_APP_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'TBO applicability with shared tables follows effective prefix KV placement, not its saved choice',
+    async () => {
+      history.replaceState(
+        null,
+        '',
+        '/?m=Qwen/Qwen3.8-Flash-Next&n=2&dp=2&ep=2&b=4&ltdp=1&okt=ram&okp=25',
+      );
+      mount();
+      await screen.findByTestId('decode-tps');
+      expect(screen.getByRole('radiogroup', { name: 'Two-batch overlap' })).toBeTruthy();
+      fireEvent.change(screen.getByRole('spinbutton', { name: 'Prefix cache hit %' }), {
+        target: { value: '50' },
+      });
+      await waitFor(() =>
+        expect(screen.queryByRole('radiogroup', { name: 'Two-batch overlap' })).toBeNull(),
+      );
+    },
+    HEAVY_APP_TEST_TIMEOUT_MS,
+  );
+
   it('keeps Advanced closed until opened, then its subsections are open', async () => {
     const { container } = mount();
     await screen.findByTestId('decode-tps');
@@ -705,16 +747,17 @@ describe('estimator inputs', () => {
       offload: ['Token embeddings', 'KV cache on GPU %'],
     },
     {
-      name: 'a lookup-table model',
+      name: 'a lookup-table model at DP 1',
       query: '?m=Qwen/Qwen3.8-Flash-Next',
       offload: ['Token embeddings', 'Lookup tables', 'KV cache on GPU %'],
     },
     {
       name: 'expert offload on a lookup-table model',
-      query: '?m=Qwen/Qwen3.8-Flash-Next&ox=ram',
+      query: '?m=Qwen/Qwen3.8-Flash-Next&n=2&dp=2&b=2&ox=ram',
       offload: [
         'Token embeddings',
         'Lookup tables',
+        'Share lookup tables across DP',
         'KV cache on GPU %',
         'Queue depth',
         'Prefetch accuracy %',
@@ -722,10 +765,11 @@ describe('estimator inputs', () => {
     },
     {
       name: 'a lookup-table split',
-      query: '?m=deepseek-ai/DeepSeek-V4.1-Flash&olt=split',
+      query: '?m=deepseek-ai/DeepSeek-V4.1-Flash&n=2&dp=2&b=2&olt=split',
       offload: [
         'Token embeddings',
         'Lookup tables',
+        'Share lookup tables across DP',
         'Layers in host RAM',
         'Host RAM holds',
         'Scale layout',
@@ -773,6 +817,34 @@ describe('estimator inputs', () => {
       expect(labels).toEqual(offload);
     },
   );
+  it('table sharing is available only for Device, and changing the tier clears the saved flag', async () => {
+    history.replaceState(null, '', '/?m=deepseek-ai/DeepSeek-V4.1-Flash&n=2&dp=2&b=2&ltdp=1');
+    mount();
+    await screen.findByTestId('decode-tps');
+    const sharing = () =>
+      screen.getByRole('combobox', { name: 'Share lookup tables across DP' }) as HTMLButtonElement;
+    expect(sharing().disabled).toBe(false);
+    expect(sharing().textContent).toContain('on');
+    const placement = () =>
+      within(screen.getByTestId('offload-advanced')).getByRole('combobox', {
+        name: 'Lookup tables',
+      });
+    for (const tier of ['Host RAM', 'SSD', 'Host RAM + SSD']) {
+      fireEvent.click(placement());
+      fireEvent.click(await screen.findByRole('option', { name: tier }));
+      expect(sharing().disabled).toBe(true);
+      expect(sharing().textContent).toContain('off');
+      await waitFor(() => expect(location.search).not.toContain('ltdp'));
+    }
+    fireEvent.click(placement());
+    fireEvent.click(await screen.findByRole('option', { name: 'Device' }));
+    expect(sharing().disabled).toBe(false);
+    expect(sharing().textContent).toContain('off');
+    fireEvent.click(sharing());
+    fireEvent.click(await screen.findByRole('option', { name: 'on' }));
+    await waitFor(() => expect(location.search).toContain('ltdp=1'));
+  });
+
   it('token embeddings: Host RAM writes oet=ram and brings in the host controls; On GPU removes it', async () => {
     history.replaceState(null, '', '/?m=Qwen/Qwen3.8-27B');
     mount();
@@ -1055,6 +1127,46 @@ describe('prefill/decode disaggregation', () => {
     await waitFor(() => expect(location.search).toContain('dec.b=288'));
     expect(location.search).toContain('&b=32&');
   });
+
+  it.each([
+    [1, 2],
+    [2, 1],
+    [1, 1],
+  ])(
+    'lookup sharing control considers both pools: prefill DP %i / decode DP %i',
+    async (prefillDp, decodeDp) => {
+      history.replaceState(
+        null,
+        '',
+        `/?m=Qwen/Qwen3.8-Flash-Next&n=${prefillDp}&dp=${prefillDp}&b=2&ltdp=1&pd=1&dec.n=${decodeDp}&dec.dp=${decodeDp}&dec.b=2`,
+      );
+      mount();
+      await screen.findByTestId('pd-system-tps', {}, { timeout: 5000 });
+      const pool = screen.getByRole('radiogroup', { name: 'Edit pool' });
+      const sharing = () =>
+        screen.queryByRole('combobox', { name: 'Share lookup tables across DP' });
+      const applicable = prefillDp > 1 || decodeDp > 1;
+      for (const name of ['Prefill', 'Decode']) {
+        fireEvent.click(within(pool).getByRole('radio', { name }));
+        if (applicable) expect(sharing()?.textContent).toContain('on');
+        else expect(sharing()).toBeNull();
+      }
+      if (applicable) {
+        // This is a shared deployment choice even when edited from the DP1 pool.
+        fireEvent.click(
+          within(pool).getByRole('radio', { name: prefillDp === 1 ? 'Prefill' : 'Decode' }),
+        );
+        fireEvent.click(sharing()!);
+        fireEvent.click(await screen.findByRole('option', { name: 'off' }));
+        await waitFor(() => expect(location.search).not.toContain('ltdp'));
+        fireEvent.click(
+          within(pool).getByRole('radio', { name: prefillDp === 1 ? 'Decode' : 'Prefill' }),
+        );
+        expect(sharing()?.textContent).toContain('off');
+      }
+    },
+    HEAVY_APP_TEST_TIMEOUT_MS,
+  );
 
   it('turning it off gives back the single-pool page and URL', async () => {
     const query = '?m=zai-org/GLM-5.3-Flash&d=h100-sxm&n=8&nodes=4&dp=32&ep=32&lay=dep&b=32';

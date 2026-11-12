@@ -1,8 +1,10 @@
 import { Fragment, useState } from 'react';
 import type { OverlapClass } from '../../sim/engine/types';
+import { hasOffDevicePlacement } from '../../sim/engine/offloadRules';
 import {
   effectiveParallel,
   hasMoe,
+  hasLookupCollectives,
   offloadsAnything,
   overlapClassesOf,
   twoBatchOverlapApplies,
@@ -50,6 +52,17 @@ const CLASS_ROWS: Record<OverlapClass, { label: string; percentLabel: string; he
   },
 };
 
+/** The existing TP class also controls shared lookup exchanges, including at TP1. */
+const LOOKUP_TP_ROW = {
+  label: 'TP / lookup exchange',
+  percentLabel: 'Exchange hidden %',
+  help: [
+    'Share of the TP and lookup-table transfer time that can hide behind compute.',
+    'Only bandwidth time can overlap; message latency stays on the critical path.',
+    'Default follows Communication overlap under Assumptions.',
+  ],
+};
+
 const PERCENT_HELP = helpLines([
   'Share of this exchange hidden behind compute, in percent.',
   '0% adds it all to the step; 100% hides it all, up to the compute time.',
@@ -62,7 +75,7 @@ const TWO_BATCH_HELP = helpLines([
 ]);
 
 /**
- * Hardware → Advanced → "Communication overlap": per overlap class (TP all-reduce, EP all-to-all, PP send; only the
+ * Hardware → Advanced → "Communication overlap": per overlap class (TP/lookup exchanges, EP exchanges, PP send; only the
  * classes the run has, `overlapClassesOf`) the share of its transfer time that may hide behind compute
  * (`SimOptions.overlapByClass`: Default follows Assumptions → Communication overlap, None 0, Full 1, Partial a
  * percent), and two-batch overlap (`DeploymentChoice.twoBatchOverlap`, MoE mode B only; docs/simulation-model.md §7
@@ -73,12 +86,23 @@ export function OverlapFields({ state, dispatch, loaded, built }: PanelProps) {
   const [editing, setEditing] = useState<ReadonlySet<OverlapClass>>(new Set());
   if (loaded === null) return null;
   const parallel = effectiveParallel(state.parallel, loaded.model, state.parallelLayout);
-  const classes = overlapClassesOf(loaded.model, parallel);
+  const lookupCollectives = hasLookupCollectives(
+    loaded.model,
+    parallel,
+    state.deployment.offload,
+    built.hardware?.topology,
+  );
+  const classes = overlapClassesOf(loaded.model, parallel, lookupCollectives);
   if (classes.length === 0) return null;
   const twoBatchOn = state.deployment.twoBatchOverlap === true;
+  // Match buildSimInput's effective placement: a saved prefix-only KV choice need not move data in this run.
+  const offloads =
+    built.kind === 'ok'
+      ? hasOffDevicePlacement(built.input.deployment?.offload, state.workload.prefixCacheHitRatio)
+      : offloadsAnything(state.deployment.offload);
   const twoBatchShown =
     hasMoe(loaded.model) &&
-    (twoBatchOverlapApplies(loaded.model, parallel, offloadsAnything(state.deployment.offload)) ||
+    (twoBatchOverlapApplies(loaded.model, parallel, offloads) ||
       (twoBatchOn && parallel.ep > parallel.tp));
   const globalLabel = (state.options.overlap ?? 'ideal') === 'ideal' ? 'full' : 'none';
   const byClass = state.options.overlapByClass ?? {};
@@ -103,7 +127,7 @@ export function OverlapFields({ state, dispatch, loaded, built }: PanelProps) {
     <fieldset className="unlock advanced-fields" data-testid="overlap-advanced">
       <legend>Communication overlap</legend>
       {classes.map((c) => {
-        const row = CLASS_ROWS[c];
+        const row = c === 'tp' && lookupCollectives ? LOOKUP_TP_ROW : CLASS_ROWS[c];
         const mode = modeOf(c);
         const defaultLabel = `Default (${c === 'ep' && twoBatchOn ? 'full' : globalLabel})`;
         const f = byClass[c] ?? DEFAULT_PARTIAL;

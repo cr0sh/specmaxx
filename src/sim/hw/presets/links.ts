@@ -449,6 +449,7 @@ export const HOST_PCIE_LINKS: LinkSpec[] = ([5, 4, 3] as const).flatMap((g) =>
 export const RTX_3090_NVLINK: LinkSpec = {
   kind: 'nvlink_bridge',
   name: 'RTX 3090 NVLink bridge',
+  fullyConnectedDevices: 2,
   bandwidthPerDirectionBytesPerSec: 56.25e9,
   latencySec: 1e-6,
   p2p: 'direct',
@@ -458,7 +459,7 @@ export const RTX_3090_NVLINK: LinkSpec = {
         'https://images.nvidia.com/aem-dam/en-zz/Solutions/geforce/amp' +
         'ere/pdf/NVIDIA-ampere-GA102-GPU-Architecture-Whitepaper-V1.pdf',
       title: 'NVIDIA Ampere GA102 architecture whitepaper',
-      fields: [BANDWIDTH_FIELD],
+      fields: [BANDWIDTH_FIELD, 'fullyConnectedDevices'],
       note: 'Four x4 links, each 14.0625 GB/s in each direction: 4 × 14.0625 = 56.25 GB/s, not 112.5 per direction.',
     },
   ],
@@ -474,6 +475,7 @@ export const RTX_3090_NVLINK: LinkSpec = {
 export const NVLINK_3: LinkSpec = {
   kind: 'nvlink',
   name: 'NVLink3 / NVSwitch',
+  fullyConnectedDevices: 8,
   bandwidthPerDirectionBytesPerSec: 300e9,
   latencySec: 0.8e-6,
   p2p: 'direct',
@@ -483,6 +485,12 @@ export const NVLINK_3: LinkSpec = {
       title: 'A100 architecture whitepaper, third-generation NVLink',
       fields: [BANDWIDTH_FIELD],
       note: 'Twelve links, each 25 GB/s per direction: 600 GB/s bidirectional, 300 GB/s per direction.',
+    },
+    {
+      url: 'https://docs.nvidia.com/dgx/dgxa100-user-guide/introduction-to-dgxa100.html',
+      title: 'DGX A100 hardware overview',
+      fields: ['fullyConnectedDevices'],
+      note: 'Eight A100 GPUs with six NVSwitches. Full peer access is established for this eight-device profile, not arbitrary larger NVLink3 domains.',
     },
   ],
   estimated: [
@@ -498,11 +506,12 @@ export const A100_NVLINK_BRIDGE: LinkSpec = {
   ...NVLINK_3,
   kind: 'nvlink_bridge',
   name: 'A100 NVLink bridge (2 GPUs)',
+  fullyConnectedDevices: 2,
   sources: [
     {
       url: 'https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/PB-10577-001_v02.pdf',
       title: 'A100 PCIe product brief, NVLink Table 5',
-      fields: [BANDWIDTH_FIELD],
+      fields: [BANDWIDTH_FIELD, 'fullyConnectedDevices'],
       note: 'All three bridges to one adjacent A100: total maximum NVLink bandwidth 600 Gbytes/s (Tx + Rx), 300 GB/s per direction. Same rate on 40GB and 80GB; do not mix capacities.',
     },
   ],
@@ -510,7 +519,8 @@ export const A100_NVLINK_BRIDGE: LinkSpec = {
 
 /**
  * V100 DGX-1 hybrid cube-mesh, aggregate six-link injection: 150 GB/s per direction per GPU.
- * NOT all-to-all: only four peers direct. Optimistic for subgroups and non-neighbour traffic (docs §6).
+ * NOT all-to-all: only four peers direct. No fullyConnectedDevices claim, even for subgroups: rank adjacency is
+ * not modeled. Optimistic for collective subgroups and non-neighbour traffic (docs §6).
  */
 export const NVLINK_2_HCM_8: LinkSpec = {
   kind: 'nvlink',
@@ -538,13 +548,14 @@ export const NVLINK_2_HCM_8: LinkSpec = {
 export const NVLINK_2_MESH_4: LinkSpec = {
   ...NVLINK_2_HCM_8,
   name: 'NVLink2 fully connected mesh (4 GPUs)',
+  fullyConnectedDevices: 4,
   sources: [
     ...NVLINK_2_HCM_8.sources,
     {
       url: 'https://github.com/NVIDIA/nccl-tests/issues/251',
       title: 'Four V100-SXM2-16GB topology matrix',
       kind: 'community',
-      fields: [BANDWIDTH_FIELD],
+      fields: [BANDWIDTH_FIELD, 'fullyConnectedDevices'],
       note: 'All four GPUs have NV2 to each of the other three: 50 GB/s per peer, 150 GB/s aggregate injection. Optimistic for TP2 subgroups.',
     },
   ],
@@ -553,12 +564,13 @@ export const NVLINK_2_MESH_4: LinkSpec = {
 export const NVLINK_2_PAIR: LinkSpec = {
   ...NVLINK_2_MESH_4,
   name: 'NVLink2 peer pair (2 links)',
+  fullyConnectedDevices: 2,
   bandwidthPerDirectionBytesPerSec: 50e9,
   sources: [
     {
       url: 'https://images.nvidia.com/content/volta-architecture/pdf/volta-architecture-whitepaper.pdf',
       title: 'Volta NVLink, Figure 12 NV2 edges',
-      fields: [BANDWIDTH_FIELD],
+      fields: [BANDWIDTH_FIELD, 'fullyConnectedDevices'],
       note: 'Two direct NVLinks × 25 GB/s per direction = 50 GB/s for a selected NV2 pair.',
     },
   ],
@@ -589,12 +601,19 @@ const NVLINK_SWITCH_SHARP_SOURCE: SourceRef = {
 export const NVLINK_4: LinkSpec = {
   kind: 'nvlink',
   name: 'NVLink4 / NVSwitch',
+  fullyConnectedDevices: 8,
   bandwidthPerDirectionBytesPerSec: 18 * 25e9,
   latencySec: 0.8e-6,
   p2p: 'direct',
   inNetworkReduction: 'nvls',
   sources: [
     NVSWITCH_GEN3_NVLS_SOURCE,
+    {
+      url: 'https://docs.nvidia.com/dgx/dgxh100-user-guide/introduction-to-dgxh100.html',
+      title: 'DGX H100/H200 hardware overview',
+      fields: ['fullyConnectedDevices'],
+      note: 'Eight H100/H200 GPUs interconnected through NVSwitch. This profile certifies the eight-device domain, not every possible NVLink4 switch system.',
+    },
     {
       url: 'https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/',
       title: 'NVIDIA Hopper architecture in depth',
@@ -623,12 +642,19 @@ export const NVLINK_4: LinkSpec = {
 export const NVLINK_5: LinkSpec = {
   kind: 'nvlink',
   name: 'NVLink5 / NVSwitch',
+  fullyConnectedDevices: 8,
   bandwidthPerDirectionBytesPerSec: 18 * 50e9,
   latencySec: 0.8e-6,
   p2p: 'direct',
   inNetworkReduction: 'nvls',
   sources: [
     NVLINK_SWITCH_SHARP_SOURCE,
+    {
+      url: 'https://docs.nvidia.com/dgx/dgxb200-user-guide/introduction-to-dgxb200.html',
+      title: 'DGX B200 hardware overview',
+      fields: ['fullyConnectedDevices'],
+      note: 'Eight B200 GPUs with two NVLink switches. The separate NVL72 profile certifies a 72-device domain.',
+    },
     {
       url: 'https://dam-cdn.nvd.orangelogic.com/AssetLink/gl2l4l4812s5fw0p614s6i8bv6mi3vx5.pdf',
       title: 'NVIDIA Blackwell architecture technical overview',
@@ -1310,30 +1336,33 @@ export const ETHERNET_10G_TCP = ethernetTcp(10);
 export const NVLINK_5_NVL72: LinkSpec = {
   ...NVLINK_5,
   name: 'NVLink5 / NVL72 NVLink Switch',
+  fullyConnectedDevices: 72,
   sources: [
     ...NVLINK_5.sources,
     {
       url: GB200_NVL72_URL,
       title: 'GB200 NVL72',
-      fields: [BANDWIDTH_FIELD],
+      fields: [BANDWIDTH_FIELD, 'fullyConnectedDevices'],
       note: '130 TB/s bidirectional rack total (rounded), 72 GPUs, 1.8 TB/s per GPU.',
     },
   ],
 };
 
-/** `link` without its in-network reduction capability (a link built from a switched one that has no switch). */
-function withoutInNetworkReduction(link: LinkSpec): LinkSpec {
+/** A bridge must not inherit the switched profile's reduction or full-domain peer-access claims. */
+function withoutSwitchCapabilities(link: LinkSpec): LinkSpec {
   const copy = { ...link };
   delete copy.inNetworkReduction;
+  delete copy.fullyConnectedDevices;
   return copy;
 }
 
 /** NVL4 bridge: 7.2 TB/s bidirectional / 4 / 2 = 900 GB/s per GPU per direction aggregate; optimistic for subgroups.
- * A bridge has no NVLink Switch, so no NVLS (`inNetworkReduction` absent, not inherited from {@link NVLINK_5}).
+ * A bridge has no NVLink Switch, so no NVLS. Its mesh is inferred, not established: fullyConnectedDevices is
+ * absent too, rather than inherited from {@link NVLINK_5}. Collective injection remains the existing estimate.
  * See docs/simulation-model.md §4 "Scale-up domains".
  */
 export const NVLINK_5_NVL4: LinkSpec = {
-  ...withoutInNetworkReduction(NVLINK_5),
+  ...withoutSwitchCapabilities(NVLINK_5),
   kind: 'nvlink_bridge',
   name: 'NVLink5 / NVL4 bridge (mesh estimate)',
   sources: [

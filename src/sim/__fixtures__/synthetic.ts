@@ -105,14 +105,17 @@ export const SYNTH_UNIFIED: DeviceSpec = {
   estimated: [],
 };
 
-/** Synthetic NVLink-class intra-node link: 100 GB/s per direction, α 1 µs, direct P2P. */
+/** Synthetic fully connected 8-device NVLink domain: 100 GB/s per direction, α 1 µs, direct P2P. */
 export const SYNTH_NVLINK: LinkSpec = {
   kind: 'nvlink',
   name: 'Synthetic NVLink',
   bandwidthPerDirectionBytesPerSec: 100e9,
   latencySec: 1e-6,
   p2p: 'direct',
-  sources: [syntheticSource(['bandwidthPerDirectionBytesPerSec', 'latencySec'])],
+  fullyConnectedDevices: 8,
+  sources: [
+    syntheticSource(['bandwidthPerDirectionBytesPerSec', 'latencySec', 'fullyConnectedDevices']),
+  ],
   estimated: [],
 };
 

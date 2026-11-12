@@ -244,6 +244,16 @@ export interface LinkSpec {
   latencySec: number;
   /** `'direct'` = device-to-device transfers; `'host_bounce'` = staged through host memory (e.g. GeForce without P2P). */
   p2p: 'direct' | 'host_bounce';
+  /**
+   * Largest fully connected device domain established for this link profile, including the local device.
+   * Every device can directly address every other device's memory (through a switch or a full mesh).
+   * A positive claim about the whole domain, NOT the number of neighbours on a partial mesh. Absent = unknown
+   * or partial connectivity: no peer-HBM lookup fast path. A smaller DP group does not certify an oversized
+   * modeled node. This is a profile limit, not a limit of the NVLink generation. Unit: devices, safe integer ≥ 2.
+   * Physical capability independent of `p2p` driver state and NVLS; `sources[]` must cover it.
+   * See docs/simulation-model.md §4 "Links and topologies", §5 "Lookup tables across DP".
+   */
+  fullyConnectedDevices?: number;
   /** Host staging parameters; present iff `p2p === 'host_bounce'`. */
   hostBounce?: {
     /** Host memory bandwidth available to staging, shared by all devices of the node. Unit: B/s. */

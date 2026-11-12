@@ -113,6 +113,21 @@ describe('memorySuggestions', () => {
     expect(r.suggestions[0].help.join(' ')).toContain('Frees 30.0GB per device');
   });
 
+  it('device overflow: shared tables remain eligible for a host-placement fix that clears sharing', () => {
+    const r = memorySuggestions({
+      model: MOE_TABLES,
+      memory: memory([stage(100)]),
+      offload: { tables: { acrossDp: true } },
+      host: {},
+      probe: (actions) =>
+        offloadOf(actions)?.tables?.tier === 'host_ram'
+          ? memory([stage(70)], [['host_ram', 30, 96]])
+          : undefined,
+    });
+    expect(r.suggestions.map((s) => s.label)).toEqual(['n-gram tables → host RAM']);
+    expect(offloadOf(r.suggestions[0].actions)?.tables).toEqual({ tier: 'host_ram' });
+  });
+
   it('device overflow: uses the SSD when the data does not fit the host RAM; drops fixes that do not help', () => {
     const probe = (actions: PoolAction[]) => {
       const o = offloadOf(actions)!;

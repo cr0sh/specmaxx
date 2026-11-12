@@ -9,19 +9,51 @@
 
 import type { OverlapClass, SimOptions } from '../../sim/engine/types';
 import type { ModelSpec, ParallelConfig } from '../../sim/ir/model';
+import type { TopologySpec } from '../../sim/hw/types';
+import { lookupTablesUsePeerReads } from '../../sim/engine/placement';
+import type { OffloadChoice } from './deployment';
 import { hasMoe } from './deploymentInput';
 
-/** Every overlap class, in display and URL order: TP all-reduce, EP all-to-all, PP send. */
+/** Every overlap class, in display and URL order: TP/lookup exchanges, EP exchanges, PP send. */
 export const OVERLAP_CLASSES: readonly OverlapClass[] = ['tp', 'ep', 'pp'];
 
 /**
- * The overlap classes that have communication in this run: `tp` with TP > 1 (TP, expert-TP and DCP collectives),
+ * Whether shared lookup tables emit collectives on the resolved (modified) topology. PLE always exchanges rows;
+ * Engram TP1 peer reads are gather-internal work, not a collective overlap class. Missing hardware means unresolved.
+ * See docs/simulation-model.md §5 "Lookup tables across DP", §7 "Stage time and overlap".
+ */
+export function hasLookupCollectives(
+  model: ModelSpec,
+  parallel: ParallelConfig,
+  offload: OffloadChoice | undefined,
+  topology: TopologySpec | undefined,
+): boolean {
+  if (
+    parallel.dp <= 1 ||
+    offload?.tables?.acrossDp !== true ||
+    offload.tables.tier !== undefined ||
+    topology === undefined
+  )
+    return false;
+  const peer = lookupTablesUsePeerReads(parallel, topology);
+  return model.layers.some((l) =>
+    l.blocks.some((b) => b.kind === 'ngram_embedding' && (!peer || b.headRows === undefined)),
+  );
+}
+
+/**
+ * The overlap classes that have communication in this run: `tp` with TP > 1 (TP, expert-TP and DCP collectives)
+ * or lookup collectives ({@link hasLookupCollectives}),
  * `ep` on a MoE model with EP > TP (mode B: the all-to-alls and the DP attention + EP collectives), `pp` with PP > 1
  * (the send to the next stage). In {@link OVERLAP_CLASSES} order.
  */
-export function overlapClassesOf(model: ModelSpec, parallel: ParallelConfig): OverlapClass[] {
+export function overlapClassesOf(
+  model: ModelSpec,
+  parallel: ParallelConfig,
+  lookupCollectives = false,
+): OverlapClass[] {
   const present: Record<OverlapClass, boolean> = {
-    tp: parallel.tp > 1,
+    tp: parallel.tp > 1 || lookupCollectives,
     ep: hasMoe(model) && parallel.ep > parallel.tp,
     pp: parallel.pp > 1,
   };
@@ -48,11 +80,12 @@ export function effectiveOptions(
   options: Partial<SimOptions>,
   model: ModelSpec,
   parallel: ParallelConfig,
+  lookupCollectives = false,
 ): Partial<SimOptions> {
   const { overlapByClass, ...rest } = options;
   if (overlapByClass === undefined) return options;
   const kept: Partial<Record<OverlapClass, number>> = {};
-  for (const c of overlapClassesOf(model, parallel))
+  for (const c of overlapClassesOf(model, parallel, lookupCollectives))
     if (overlapByClass[c] !== undefined) kept[c] = overlapByClass[c];
   return Object.keys(kept).length > 0 ? { ...rest, overlapByClass: kept } : rest;
 }
