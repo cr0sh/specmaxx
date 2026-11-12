@@ -546,7 +546,7 @@ function elementwiseBytes(op: ElementwiseOp): ByteBreakdown {
   });
 }
 
-/** Memory traffic of an embedding gather: one table row per token read, one activation row written. Unit: bytes. */
+/** Memory traffic of an embedding gather: `rowsRead ?? tokens` table rows read (shared masked lookups fetch `rowsRead` rows; without it, one row per token) and `tokens` activation rows written. Unit: bytes. */
 function embeddingBytes(op: EmbeddingOp): ByteBreakdown {
   // Formula: W = (rowsRead ?? tokens)·hidden·bpe(w); write = tokens·hidden·bpe(out)
   // Shared masked lookups separate fetched rows from output rows; absent rowsRead keeps the conservative gather.
